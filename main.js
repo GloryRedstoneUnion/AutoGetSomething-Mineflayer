@@ -107,7 +107,7 @@ let busy = false
 bot.on("message",async (msg,pr)=> {
     msg=msg.toString()
     console.log(msg)
-    let match = msg.match(/^<([^>]+)>\s+!!get\s+([a-z0-9_\-.]+:[a-z0-9_\-.]+)\s+(\d+)/i);
+    let match = msg.match(/^<([^>]+)>\s+!!get\s+(.+?)\s+(\d+)/i);
     if(!match)
     {
         match = msg.match(/^<([^>]+)>\s*我要\s+(.+?)\s+(\d+)\s*$/);
@@ -374,6 +374,7 @@ bot.on("message",async (msg,pr)=> {
                     }
                     else
                     {
+                        let pos=blocks.get(ItemInfo.name)
                         bot.activateBlock(bot.blockAt(new Vec3(pos.dx,pos.fo.y,pos.fo.z)))
                         const window=await waitForContainerOpen()
                         for(let slot=54;slot<=89;slot++)
@@ -411,12 +412,11 @@ bot.on("message",async (msg,pr)=> {
         let before=id
         let chenged=0
         records.forEach(item => {
-            if(id==item.minecraft || id==item.en_us || id==item.zh_cn)
+            if((id==item.minecraft || id==item.en_us || id==item.zh_cn) && ((chenged==1 && item.zh_cn.length<before.length) || !chenged))
             {
                 id=item.minecraft
                 before=item.zh_cn
                 chenged=1
-                return 
             }
         })
         if(!chenged)
@@ -426,12 +426,24 @@ bot.on("message",async (msg,pr)=> {
             return 
         }
         bot.chat("是的，我知道，"+before+"，一点不错")
-        const Item = require('prismarine-item')(bot.registry)
-        await main(new Item(bot.registry.itemsByName[id].id,1),count)
+        let Item,it
+        try
+        {
+            Item = require('prismarine-item')(bot.registry)
+            it=new Item(bot.registry.itemsByName[id].id,1)     
+        }
+        catch (err)
+        {
+            const errorMsg = err?.message ? String(err.message) : String(err);
+            bot.chat(errorMsg?`错误，未知的物品：${errorMsg}`:"错误：未知的物品");
+            return 
+        }
+        await main(it,count)
         bot.chat("/playerTools bot_item inventory")
         window = await waitForContainerOpen()
         for(let slot=54;slot<=89;slot++)
         {
+            bot.clickWindow(slot,0,1)
             bot.clickWindow(slot,0,1)
         }
         bot.closeWindow(window)
