@@ -1,4 +1,5 @@
 const mineflayer = require('mineflayer')
+const readline = require('readline');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const { GoalBlock } = goals
 const fs = require('fs')
@@ -10,11 +11,24 @@ const records = parse(data, {
   skip_empty_lines: true
 })
 
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: ""   // 提示符
+})
+
 const bot = mineflayer.createBot({
   host: 'inbound.grunion.world',
   port: 30000,
   username: 'Chat',
   version: '1.20.1'
+})
+
+rl.prompt()
+rl.on('line', (line) => {
+    const input = line.trim()
+    bot.chat(input)
+    rl.prompt()
 })
 
 bot.loadPlugin(pathfinder)
@@ -457,4 +471,7 @@ bot.on("message",async (msg,pr)=> {
     {
         busy=false
     }
+})
+rl.on('close', () => {
+    process.exit(0)
 })
