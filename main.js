@@ -84,12 +84,10 @@ bot.once("login",() => {
     setTimeout(() => {
         bot.chat("/login abc123456")
     }, 1000);
-    setTimeout(() => {
-        bot.chat("/server Survival")
-    }, 3000);
 })
 bot.on('death', () => {
     console.log('[BOT] 死亡，准备重生...')
+    bot.chat("额啊，齁哦哦哦齁噢噢噢")
     bot.respawn()
 })
 
@@ -471,6 +469,9 @@ bot.on("message",async (msg,pr)=> {
     {
         busy=false
     }
+})
+bot.on("spawn",()=>{
+    bot.chat("/server Survival")
 })
 rl.on('close', () => {
     process.exit(0)
