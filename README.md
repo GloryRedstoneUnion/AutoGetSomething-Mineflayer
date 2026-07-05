@@ -13,7 +13,7 @@ AutoGetSomething-Mineflayer/
 - !!get <id> <count>
   - 示例 : `!!get redstone_block 1`
 - !!todo <filename>
-  - 示例 : !!todo material_list_date.txt
+  - 示例 : `!!todo material_list_date.txt`
    
 **注意 : 物品或者id可以用中译(zh_cn)也可以用英译(en_us)，物品ID也可以，`minecraft:`可带可不带**
 
