@@ -12,7 +12,6 @@
   "type": "commonjs",
   "dependencies": {
     "chardet": "^2.2.0",
-    "chatbot-agent": "file:../chatbot",
     "csv-parse": "^7.0.0",
     "csv-parser": "^3.2.1",
     "iconv-lite": "^0.7.3",

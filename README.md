@@ -80,7 +80,6 @@ node todo.js
 - [mineflayer-pathfinder](https://github.com/PrismarineJS/mineflayer-pathfinder) — 寻路插件
 - [csv-parse](https://www.npmjs.com/package/csv-parse) / [csv-parser](https://www.npmjs.com/package/csv-parser) — 解析 `list.csv`
 - [iconv-lite](https://www.npmjs.com/package/iconv-lite) / [chardet](https://www.npmjs.com/package/chardet) — 编码处理
-- `chatbot-agent`(本地 `file:../chatbot`)— 集成的对话 agent(已注释,默认未启用)
 
 ## License
 
