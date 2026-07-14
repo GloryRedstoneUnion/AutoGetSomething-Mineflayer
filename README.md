@@ -83,7 +83,7 @@ node todo.js
 
 ## License
 
-This project is licensed under the CC BY-NC 4.0 License.
+This project is licensed under the [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) License.
 
 You are free to:
 - Use this project
