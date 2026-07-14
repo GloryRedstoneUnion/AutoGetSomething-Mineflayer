@@ -26,11 +26,20 @@ precision_server.py
                        "epsilon":"1e-30","precision":50}
         }
         resp: {"roots":["-2.0","2.0"]}
+    POST /limit         数值极限 lim_{var->point} expr
+        body: {
+            "expression":"(1 + 1/x)^x",
+            "variable":"x",
+            "point":"inf",
+            "precision":50
+        }
+        resp: {"result": "2.7182818284590452353602874713526624977572470936999595..."}
 -----------------------------------------------------------------------------
 """
 import ast
 import json
 import operator
+import re
 import sys
 import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -46,6 +55,7 @@ try:
         asin, acos, atan, atan2,
         sinh, cosh, tanh,
         exp, log, log10, sqrt, power,
+        limit,
         pi, e, phi, inf, nan,
         floor as mpfloor, ceil as mpceil
     )
@@ -117,10 +127,18 @@ def _eval(node, env):
     if isinstance(node, ast.Constant):
         if isinstance(node.value, bool):
             return mpf(1 if node.value else 0)
-        if isinstance(node.value, (int, float)):
+        if isinstance(node.value, int):
             return mpf(node.value)
+        if isinstance(node.value, float):
+            # ★ 关键: 走字符串通道, 让 mpf 按当前精度精确解析
+            #   mpf(0.1)   -> 0.10000000000000000555... (Python float 已失精)
+            #   mpf('0.1') -> 0.1 (按当前精度精确解析)
+            return mpf(repr(node.value))
         raise ValueError("unsupported constant: %r" % (node.value,))
     if hasattr(ast, "Num") and isinstance(node, ast.Num):  # py<3.8
+        # Num 节点的 n 可能是 int 或 float, float 也要走字符串
+        if isinstance(node.n, float):
+            return mpf(repr(node.n))
         return mpf(node.n)
     if isinstance(node, ast.Name):
         if node.id in env:
@@ -141,9 +159,15 @@ def _eval(node, env):
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name):
             raise ValueError("only direct function calls are supported")
-        fn = _MP_FUNCTIONS.get(node.func.id)
+        fname = node.func.id
+        # ★ 内部通道: __mpf__(字符串) -> mpf 字符串解析 (任意精度, 不丢 1e114514)
+        if fname == "__mpf__":
+            if len(node.args) != 1 or not isinstance(node.args[0], ast.Constant):
+                raise ValueError("__mpf__() requires a single string literal")
+            return mpf(node.args[0].value)
+        fn = _MP_FUNCTIONS.get(fname)
         if fn is None:
-            raise ValueError("unknown function: " + node.func.id)
+            raise ValueError("unknown function: " + fname)
         return fn(*[_eval(a, env) for a in node.args])
     raise ValueError("unsupported node: " + type(node).__name__)
 
@@ -161,6 +185,34 @@ def _caret_to_pow(src):
             out.append(c)
             i += 1
     return "".join(out)
+
+
+# 数字字面量 (整数/小数/科学计数法) 的精确正则.
+#   不能用 ast.parse 后再改 value, 因为 1e114514 已经被 Python 转成 inf(float).
+#   必须在 ast.parse 之前, 把数字字面量包成 __mpf__("...") 函数调用,
+#   这样 _eval 看到的是字符串 '1e114514', mpf('1e114514') 是任意精度的 mpf.
+#   ★ 注意: 捕获组必须包含整个数字字面量 (含可选科学计数法), 否则
+#     sub 替换时 \1 会漏掉 e114514 部分, 1e114514 被切成 1 + e114514.
+_NUMBER_RE = re.compile(
+    r"(?<![\w\.])"                            # 前面不是 word char / .
+    r"([+\-]?(?:\d+\.?\d*|\.\d+)"             # 整数/小数 (可带正负号)
+    r"(?:[eE][+\-]?\d+)?)"                    # 可选科学计数法 (含在捕获组内)
+    r"(?![\w\.])"                             # 后面不是 word char / .
+)
+
+
+def _wrap_numbers_as_mpf(expr):
+    """把表达式里的所有数字字面量替换为 __mpf__('...') 函数调用.
+
+    例如: "1e114514" -> "__mpf__('1e114514')"
+          "1.5e-10"  -> "__mpf__('1.5e-10')"
+          "2"        -> "__mpf__('2')"
+          "1/3"      -> "__mpf__('1')/__mpf__('3')"
+
+    注意: _insert_implicit_mul 必须在 _wrap_numbers_as_mpf 之后调用,
+    否则 2x 会被误包成 __mpf__('2x').
+    """
+    return _NUMBER_RE.sub(r"__mpf__('\1')", expr)
 
 def _insert_implicit_mul(src):
     """在 token 之间按需插入 *. 例外: 函数调用 NAME( 不插."""
@@ -208,12 +260,20 @@ def evaluate_expression(expr, variables, precision):
             "mpmath is not installed. Run: pip install mpmath"
         )
     setup_mpmath(precision)
+    expr = _wrap_numbers_as_mpf(expr)   # ★ 先包数字字面量, 防 1e114514 变 inf
     expr = _insert_implicit_mul(expr)  # 隐式乘法 2x / (a)(b)
     expr = _caret_to_pow(expr)         # 前端 ^  =>  Python **
     env = dict(_MP_CONSTANTS)
     if variables:
         for k, v in variables.items():
-            env[k] = mpf(v)
+            # ★ 同样: float 走 repr/str, 让 mpf 按当前精度精确解析
+            if isinstance(v, float):
+                env[k] = mpf(repr(v))
+            elif isinstance(v, int):
+                env[k] = mpf(v)
+            else:
+                # 字符串等, 交给 mpf 自己处理
+                env[k] = mpf(v)
     tree = ast.parse(expr, mode="eval")
     return _eval(tree.body, env)
 
@@ -238,7 +298,13 @@ def solve_equation(expr, variable, start, end, samples, epsilon, precision, vari
     env = dict(_MP_CONSTANTS)
     if variables:
         for k, v in variables.items():
-            env[k] = mpf(v)
+            # ★ 同样: float 走 repr 保持精度
+            if isinstance(v, float):
+                env[k] = mpf(repr(v))
+            elif isinstance(v, int):
+                env[k] = mpf(v)
+            else:
+                env[k] = mpf(v)
 
     def f(x):
         env[variable] = x
@@ -338,7 +404,11 @@ def solve_equation(expr, variable, start, end, samples, epsilon, precision, vari
                     fmid = f(mid)
                 except Exception:
                     break
-                if abs(fmid) < eps or (hi - lo) < eps * 10:
+                # ★ 修复: 不能用 abs(fmid) < eps 作为收敛判据!
+                #   对 x+1=2 这种线性方程, mid 接近根时 f(mid) 会很小 (1e-49),
+                #   但 mid 本身可能仍有 1e-49 量级误差, 并不是真根.
+                #   改用 (hi - lo) < eps 作为主判据, 让区间宽度逼近 mpf 精度极限.
+                if (hi - lo) < eps:
                     add(mid); break
                 if flo * fmid < 0:
                     hi, fhi = mid, fmid
@@ -354,7 +424,8 @@ def solve_equation(expr, variable, start, end, samples, epsilon, precision, vari
                 fx = f(x)
             except Exception:
                 break
-            if abs(fx) < eps:
+            # ★ 修复: 收敛判据改严, 避免 1e-30 量级假收敛
+            if abs(fx) < eps * eps:
                 break
             h = mpf("1e-10") * max(1, abs(x))
             try:
@@ -367,7 +438,8 @@ def solve_equation(expr, variable, start, end, samples, epsilon, precision, vari
             if abs(deriv) < mpf("1e-40"):
                 break
             x_new = x - fx / deriv
-            if abs(x_new - x) < eps * max(1, abs(x)):
+            # ★ 修复: 步长判据改严, 要求 abs(diff) < eps/10, 留出足够精度余量
+            if abs(x_new - x) < eps / 10:
                 x = x_new; break
             x = x_new
         try:
@@ -385,7 +457,33 @@ def solve_equation(expr, variable, start, end, samples, epsilon, precision, vari
             out.append(r)
     return out
 
-# ---------- HTTP ----------
+# ---------- 数值极限 ----------
+def compute_limit(expr, variable, point, precision):
+    """数值极限: 用 mpmath.limit 走任意精度 Richardson/Shanks 加速
+
+    expr:    字符串,  例 "(1 + 1/x)^x"  或  "(2x + exp(4*x))^(1/x)"
+    variable: 字符串, 例 "x"
+    point:   字符串/数值, 接受 "0"  "1.5"  "inf"  "-inf"  "nan"
+    precision: 整数 dps
+    """
+    if not HAS_MPMATH:
+        raise RuntimeError("mpmath is not installed. Run: pip install mpmath")
+    setup_mpmath(precision)
+    expr = _wrap_numbers_as_mpf(expr)   # ★ 防 1e114514 变 inf
+    expr = _insert_implicit_mul(expr)  # 隐式乘法
+    expr = _caret_to_pow(expr)         # 前端 ^  =>  Python **
+    tree = ast.parse(expr, mode="eval")
+    env = dict(_MP_CONSTANTS)
+
+    def f(x):
+        env[variable] = x
+        return _eval(tree.body, env)
+
+    # 把 point 解释为 mpf (支持 inf/-inf/nan)
+    pt = mpf(point)
+    # mpmath.limit 默认 direction=+1 (从右侧接近);
+    # point 有限时单侧即可, 双向也得到同样答案.
+    return limit(f, pt)
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
@@ -449,6 +547,15 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self._send_json({"result": [str(r) for r in roots]})
 
+            elif path == "/limit":
+                result = compute_limit(
+                    data.get("expression", ""),
+                    data.get("variable", "x"),
+                    str(data.get("point", "0")),
+                    int(data.get("precision", DEFAULT_PRECISION))
+                )
+                self._send_json({"result": str(result)})
+
             else:
                 self._send_json({"error": "not found"}, 404)
 
@@ -474,6 +581,7 @@ def main():
     print("  GET  /health")
     print("  POST /evaluate  {expression, variables, precision}")
     print("  POST /solve     {expression, variable, options}")
+    print("  POST /limit     {expression, variable, point, precision}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

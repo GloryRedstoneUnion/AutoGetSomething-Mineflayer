@@ -173,7 +173,10 @@
       (t.type === 'ident' && t.value !== undefined && t.type !== 'lp') ||
       t.type === 'rp';
     const isStartOfValue = (t) => t.type === 'num' || t.type === 'ident' || t.type === 'lp';
-    const isKnownFunc = (name) => Object.prototype.hasOwnProperty.call(FUNCTIONS, name);
+    const isKnownFunc = (name) => Object.prototype.hasOwnProperty.call(FUNCTIONS, name)
+      // 高阶函数在 evaluateAst 里直接 dispatch, 不在 FUNCTIONS 表, 这里也加进白名单
+      || name === 'sum' || name === 'product' || name === 'diff'
+      || name === 'integrate' || name === 'limit';
     for (let i = 0; i < tokens.length; i++) {
       const cur = tokens[i];
       const next = tokens[i + 1];
@@ -609,6 +612,306 @@
     return r;
   }
 
+  /* ============================================================
+   * 高阶函数: sum / product / diff / integrate / limit
+   *   这些函数要拿 sub-AST, 不能放进 FUNCTIONS 表 (FUNCTIONS 拿到的是已求值结果)
+   *   所以在 evaluateAst 的 'func' 分支里直接 dispatch
+   * ============================================================ */
+
+  // 提取 var 节点的名字, 否则报错
+  function _expectVar(argAst, funcName) {
+    if (!argAst || argAst.type !== 'var') {
+      throw new Error(funcName + '() 的参数必须是变量名 (如 x)');
+    }
+    return argAst.name;
+  }
+
+  // 把任意值转成 number (Complex 取 re, BigInt 安全范围内取 Number)
+  function _toNum(v) {
+    if (typeof v === 'number') return v;
+    if (typeof v === 'bigint') {
+      if (v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER)) {
+        return Number(v);
+      }
+      throw new Error('数值超出 number 范围: ' + v.toString().slice(0, 20) + '...');
+    }
+    if (v instanceof Complex) {
+      if (Math.abs(v.im) > 1e-12) throw new Error('需要实数, 拿到复数');
+      return v.re;
+    }
+    throw new Error('无法转换为数字: ' + typeof v);
+  }
+
+  // 把整数 from/to 转 BigInt, 校验
+  function _toBigIntRange(v, name) {
+    let b;
+    if (typeof v === 'bigint') b = v;
+    else if (typeof v === 'number' && Number.isInteger(v)) b = BigInt(v);
+    else if (typeof v === 'number') throw new Error(name + ' 必须是整数, 拿到 ' + v);
+    else throw new Error(name + ' 必须是整数');
+    return b;
+  }
+
+  // 自适应 Simpson 积分 (递归)
+  //   在 [a,b] 上对 f 积分, 终止条件: |S12 - S| < 15*tol 或 depth 耗尽
+  //   返回 Richardson 外推后的值, 精度约 1e-12~1e-14
+  function _adaptiveSimpson(f, a, b, tol, maxDepth) {
+    function simpson(fa, fb, fm, h) { return (h / 3) * (fa + 4 * fm + fb); }
+    const c = (a + b) / 2;
+    const h = b - a;
+    const fa = f(a), fb = f(b), fc = f(c);
+    const S = simpson(fa, fb, fc, h);
+    return _simpsonRec(f, a, b, fa, fb, fc, S, tol, maxDepth);
+  }
+  function _simpsonRec(f, a, b, fa, fb, fc, S, tol, depth) {
+    const c = (a + b) / 2;
+    const d = (a + c) / 2;
+    const e = (c + b) / 2;
+    const fd = f(d), fe = f(e);
+    const h = b - a;
+    const Sleft  = (h / 12) * (fa + 4 * fd + fc);
+    const Sright = (h / 12) * (fc + 4 * fe + fb);
+    const S12 = Sleft + Sright;
+    if (depth <= 0 || Math.abs(S12 - S) < 15 * tol) {
+      return S12 + (S12 - S) / 15;  // Richardson 外推
+    }
+    return _simpsonRec(f, a, c, fa, fc, fd, Sleft,  tol / 2, depth - 1) +
+           _simpsonRec(f, c, b, fc, fb, fe, Sright, tol / 2, depth - 1);
+  }
+
+  // 数值求和:  sum(变量, 下界, 上界, 表达式)
+  //   - 整数迭代 (用 BigInt 避免 i 越界)
+  //   - 整数结果用 BigInt 累加, 浮点/复数结果用 Complex 累加
+  //   - 全整数且能装进 number 时返回 number, 否则返回 BigInt
+  //   - 安全上限 1e7 项
+  function _evalSum(args, baseVars) {
+    if (args.length !== 4) throw new Error('sum() 需要 4 个参数: sum(变量, 下界, 上界, 表达式)');
+    const varName = _expectVar(args[0], 'sum');
+    const fromI = _toBigIntRange(evaluateAst(args[1], baseVars), 'sum 下界');
+    const toI   = _toBigIntRange(evaluateAst(args[2], baseVars), 'sum 上界');
+    const exprAst = args[3];
+    if (fromI > toI) return 0;  // 空和
+
+    const MAX_ITER = 10000000n;
+    if (toI - fromI + 1n > MAX_ITER) {
+      throw new Error('sum() 范围太大 (>1e7), 上界减下界请 ≤ 10000000');
+    }
+
+    let bigAcc = 0n;
+    let acc = new Complex(0, 0);
+    let isExact = true;
+
+    for (let i = fromI; i <= toI; i++) {
+      const vars = Object.assign({}, baseVars);
+      vars[varName] = Number(i);  // 表达式里变量还是用 number
+      const v = evaluateAst(exprAst, vars);
+      if (typeof v === 'bigint') {
+        bigAcc += v;
+      } else if (typeof v === 'number' && Number.isInteger(v)) {
+        bigAcc += BigInt(v);
+      } else if (typeof v === 'number') {
+        isExact = false;
+        acc = acc.add(new Complex(v, 0));
+      } else if (v instanceof Complex) {
+        if (Math.abs(v.im) < 1e-12 && Number.isInteger(v.re)) {
+          bigAcc += BigInt(v.re);
+        } else {
+          isExact = false;
+          acc = acc.add(v);
+        }
+      } else {
+        throw new Error('sum() 表达式返回了不支持的类型');
+      }
+    }
+
+    if (isExact) {
+      if (bigAcc >= BigInt(Number.MIN_SAFE_INTEGER) && bigAcc <= BigInt(Number.MAX_SAFE_INTEGER)) {
+        return Number(bigAcc);
+      }
+      return bigAcc;
+    }
+    // 混合: 把整数部分加到 acc
+    if (bigAcc !== 0n) acc = acc.add(new Complex(Number(bigAcc), 0));
+    if (Math.abs(acc.im) < 1e-12) return acc.re;
+    return acc;
+  }
+
+  // 数值求积:  product(变量, 下界, 上界, 表达式)
+  function _evalProduct(args, baseVars) {
+    if (args.length !== 4) throw new Error('product() 需要 4 个参数: product(变量, 下界, 上界, 表达式)');
+    const varName = _expectVar(args[0], 'product');
+    const fromI = _toBigIntRange(evaluateAst(args[1], baseVars), 'product 下界');
+    const toI   = _toBigIntRange(evaluateAst(args[2], baseVars), 'product 上界');
+    const exprAst = args[3];
+    if (fromI > toI) return 1;  // 空积
+
+    const MAX_ITER = 10000000n;
+    if (toI - fromI + 1n > MAX_ITER) {
+      throw new Error('product() 范围太大 (>1e7)');
+    }
+
+    let acc = new Complex(1, 0);
+    for (let i = fromI; i <= toI; i++) {
+      const vars = Object.assign({}, baseVars);
+      vars[varName] = Number(i);
+      const v = evaluateAst(exprAst, vars);
+      acc = acc.mul(_toC(v));
+    }
+    if (Math.abs(acc.im) < 1e-12) return acc.re;
+    return acc;
+  }
+
+  // 数值求导:  diff(表达式, 变量)
+  //   - 中心差分:  f'(x) ≈ (f(x+h) - f(x-h)) / (2h)
+  //   - 步长:  h = max(|x|·1e-5, 1e-8), x=0 时取 1e-5
+  //   - 变量当前值:  在 baseVars 里, 缺省 0
+  function _evalDiff(args, baseVars) {
+    if (args.length !== 2) throw new Error('diff() 需要 2 个参数: diff(表达式, 变量)');
+    const exprAst = args[0];
+    const varName = _expectVar(args[1], 'diff');
+    const x0 = (baseVars && Object.prototype.hasOwnProperty.call(baseVars, varName))
+                ? _toNum(baseVars[varName]) : 0;
+    let h;
+    if (x0 === 0) h = 1e-5;
+    else h = Math.max(Math.abs(x0) * 1e-5, 1e-10);
+
+    function f(x) {
+      const vars = Object.assign({}, baseVars);
+      vars[varName] = x;
+      return evaluateAst(exprAst, vars);
+    }
+
+    const fp = _toC(f(x0 + h));
+    const fm = _toC(f(x0 - h));
+    const deriv = fp.sub(fm).div(new Complex(2 * h, 0));
+    if (Math.abs(deriv.im) < 1e-12) return deriv.re;
+    return deriv;
+  }
+
+  // 数值积分:  integrate(表达式, 变量, 下界, 上界)
+  //   - 自适应 Simpson, 递归深度上限 50, 终止容差 1e-12
+  //   - 区间过大 (|b-a| > 1e9) 会按子区间分段 (每段 1e6) 再相加
+  function _evalIntegrate(args, baseVars) {
+    if (args.length !== 4) throw new Error('integrate() 需要 4 个参数: integrate(表达式, 变量, 下界, 上界)');
+    const exprAst = args[0];
+    const varName = _expectVar(args[1], 'integrate');
+    const a = _toNum(evaluateAst(args[2], baseVars));
+    const b = _toNum(evaluateAst(args[3], baseVars));
+    if (!Number.isFinite(a) || !Number.isFinite(b)) {
+      throw new Error('integrate() 上下界必须是有限数');
+    }
+
+    function f(x) {
+      const vars = Object.assign({}, baseVars);
+      vars[varName] = x;
+      return evaluateAst(exprAst, vars);
+    }
+
+    // 区间太宽分段求和 (避免单次递归深度/精度问题)
+    const MAX_SEG = 1e6;
+    if (Math.abs(b - a) <= MAX_SEG) {
+      const r = _adaptiveSimpson(f, a, b, 1e-12, 50);
+      return Math.abs(r) < 1e-15 ? 0 : r;
+    }
+    const N = Math.ceil(Math.abs(b - a) / MAX_SEG);
+    const step = (b - a) / N;
+    let total = 0;
+    for (let i = 0; i < N; i++) {
+      const segA = a + i * step;
+      const segB = segA + step;
+      try { total += _adaptiveSimpson(f, segA, segB, 1e-9, 30); }
+      catch (e) { /* 单段失败跳过, 留给主段平均 */ }
+    }
+    return total;
+  }
+
+  // 数值极限:  limit(表达式, 变量, 趋近点)
+  //   - 从两侧用 h = 1e-1, 1e-2, ..., 1e-10 趋近
+  //   - 两侧都有限且差 < 1e-6  →  返回均值
+  //   - 一侧发散 / 两侧不同    →  返回最稳定的单侧值 (右侧优先) 或 NaN
+  //   - 趋近点为 ±∞ 时用大数 1e10 替代
+  function _evalLimit(args, baseVars) {
+    if (args.length !== 3) throw new Error('limit() 需要 3 个参数: limit(表达式, 变量, 趋近点)');
+    const exprAst = args[0];
+    const varName = _expectVar(args[1], 'limit');
+    const pointRaw = evaluateAst(args[2], baseVars);
+    const point = _toNum(pointRaw);
+
+    function f(x) {
+      const vars = Object.assign({}, baseVars);
+      vars[varName] = x;
+      try { return _toNum(evaluateAst(exprAst, vars)); } catch (e) { return NaN; }
+    }
+
+    // 趋近点是 ±∞ 时, 改用 1e10 那一侧
+    if (point === Infinity || point === -Infinity) {
+      const x = point > 0 ? 1e10 : -1e10;
+      const v = f(x);
+      return Number.isFinite(v) ? v : NaN;
+    }
+
+    // ★ 1^∞ 型检测:  形如 f(x)^g(x), f(point)=1 且 g(point)=±∞
+    //   数值上直接 f(point+h) 会因为 1+δ 失精度 (δ < 1e-10 后舍入误差主导)
+    //   标准解法: 改求 exp(limit of g(x) * ln(f(x))), 内部是 0·∞ 化 0/0 用 L'Hopital 更稳
+    //   数值上就是直接用 g·ln(f) 序列, 不再 f^g
+    if (exprAst && exprAst.type === 'binop' && exprAst.op === '^') {
+      const envAtPoint = Object.assign({}, baseVars, { [varName]: point });
+      let baseAt = NaN, expAt = NaN;
+      try { baseAt = _toNum(evaluateAst(exprAst.left, envAtPoint)); } catch (e) { baseAt = NaN; }
+      try { expAt  = _toNum(evaluateAst(exprAst.right, envAtPoint)); } catch (e) { expAt = NaN; }
+      if (baseAt === 1 && !Number.isFinite(expAt) && Math.abs(expAt) > 1e6) {
+        // 构造新 AST: g(x) * ln(f(x)), 递归求 limit
+        const innerAst = { type: 'binop', op: '*',
+          left: exprAst.right,
+          right: { type: 'func', name: 'ln', args: [exprAst.left] }
+        };
+        const innerLimit = _evalLimit([innerAst, args[1], args[2]], baseVars);
+        if (Number.isFinite(innerLimit)) return Math.exp(innerLimit);
+        // fall through to default
+      }
+    }
+
+    // 用 Richardson 序列 (h = 2^-n) + Aitken Δ² 加速
+    //   旧版 h = 1e-1..1e-10 固定 8 个点, 对 1^∞ 类精度灾难 (下表 1e-10 反而比 1e-8 差)
+    //   Aitken:  L ≈ v_n - (v_n - v_{n+1})² / (v_n - 2v_{n+1} + v_{n+2})
+    //           从最后 3 个值推一个收敛更快的估计
+    const N = 20;
+    const hs = [];
+    for (let i = 0; i < N; i++) hs.push(Math.pow(2, -i));   // 1, 0.5, 0.25, ..., ~1e-6
+    const left = [], right = [];
+    for (const h of hs) {
+      const l = f(point - h);
+      const r = f(point + h);
+      if (Number.isFinite(l)) left.push(l);
+      if (Number.isFinite(r)) right.push(r);
+    }
+    if (left.length === 0 && right.length === 0) return NaN;
+
+    // Aitken Δ² 加速
+    function aitken(seq) {
+      if (seq.length < 3) return seq[seq.length - 1];
+      const a = seq[seq.length - 1];   // 最近 (h 最小)
+      const b = seq[seq.length - 2];
+      const c = seq[seq.length - 3];
+      const d = a - 2 * b + c;
+      // 退化情况 (序列已收敛 / 完全震荡)
+      if (Math.abs(d) < 1e-15 * Math.max(1, Math.abs(a))) return a;
+      const v = a - (a - b) * (a - b) / d;
+      return Number.isFinite(v) ? v : a;
+    }
+    const aL = left.length  >= 3 ? aitken(left)  : left[left.length - 1];
+    const aR = right.length >= 3 ? aitken(right) : right[right.length - 1];
+
+    // 两侧都有限, 差 < 1e-6 倍幅 → 取均值 (比单侧更准)
+    if (Number.isFinite(aL) && Number.isFinite(aR)) {
+      const scale = Math.max(1, Math.abs((aL + aR) / 2));
+      if (Math.abs(aL - aR) <= 1e-6 * scale) return (aL + aR) / 2;
+    }
+    if (Number.isFinite(aR)) return aR;
+    if (Number.isFinite(aL)) return aL;
+    return NaN;
+  }
+
   function evaluateAst(ast, vars) {
     vars = vars || {};
     switch (ast.type) {
@@ -688,6 +991,13 @@
         throw new Error('Unknown unary operator: ' + ast.op);
       }
       case 'func': {
+        // 高阶函数: 需要 sub-AST, 走特殊 dispatch (FUNCTIONS 表里只放普通纯函数)
+        if (ast.name === 'sum')      return _evalSum(ast.args, vars);
+        if (ast.name === 'product')  return _evalProduct(ast.args, vars);
+        if (ast.name === 'diff')     return _evalDiff(ast.args, vars);
+        if (ast.name === 'integrate') return _evalIntegrate(ast.args, vars);
+        if (ast.name === 'limit')    return _evalLimit(ast.args, vars);
+
         const fn = FUNCTIONS[ast.name];
         if (!fn) throw new Error('Unknown function: ' + ast.name + '()');
         if (ast.args.length === 1) {
@@ -1540,6 +1850,17 @@
     if (expr.indexOf('=') !== -1) {
       throw new Error('Expression contains "=". Use solve() for equations.');
     }
+    // 防止 "sin with sin=1" 这种给内置函数/常量赋值的输入污染求值
+    if (vars) {
+      for (const k in vars) {
+        if (Object.prototype.hasOwnProperty.call(CONSTANTS, k)) {
+          throw new Error(`Cannot override constant "${k}"`);
+        }
+        if (Object.prototype.hasOwnProperty.call(FUNCTIONS, k)) {
+          throw new Error(`Cannot override function "${k}"`);
+        }
+      }
+    }
     const ast = parse(expr);
     const r = evaluateAst(ast, vars);
     // 极小/极大字面量: 还原成原始字符串, 不让 IEEE 754 下溢吞掉
@@ -1590,6 +1911,14 @@
         if (!(k in CONSTANTS)) { varName = k; break; }
       }
       if (!varName) throw new Error('No variable found in expression');
+    } else {
+      // 显式指定 varName 时也要校验, 防止 "pi+1=2 for pi" 这种把常量当变量
+      if (Object.prototype.hasOwnProperty.call(CONSTANTS, varName)) {
+        throw new Error(`Cannot solve for constant "${varName}"`);
+      }
+      if (Object.prototype.hasOwnProperty.call(FUNCTIONS, varName)) {
+        throw new Error(`Cannot solve for function "${varName}"`);
+      }
     }
     const ast = buildEquationAst(expr);
     return solveAst(ast, varName, options);
@@ -1634,6 +1963,47 @@
     }), timeout, 'solveAsync');
   }
 
+  // limit(expr, varName, point)
+  // expr:    字符串
+  // varName: 字符串
+  // point:   字符串/数字  ->  内部用 String(point) 转发给 Python,  支持 "inf"/"-inf"/"nan"
+  function limitAsync(expr, varName, point, options) {
+    if (typeof expr !== 'string') throw new TypeError('expr must be a string');
+    if (typeof varName !== 'string' || !varName) throw new TypeError('varName must be a non-empty string');
+    options = options || {};
+    const timeout = options.timeout || config.timeout;
+    const usePython = !!(options.pythonUrl || config.pythonUrl || options.autoStartPython || config.pythonAutoStart);
+
+    if (usePython) {
+      // Python 后端: 走 mpmath.limit, 任意精度
+      return withTimeout(
+        callPython('/limit', {
+          expression: expr,
+          variable: varName,
+          point: String(point),
+          precision: options.precision || config.defaultPrecision,
+          pythonUrl: options.pythonUrl,
+          autoStartPython: !!(options.autoStartPython || config.pythonAutoStart),
+          pythonPort: options.pythonPort || config.pythonPort,
+          pythonHost: options.pythonHost || config.pythonHost,
+          pythonScript: options.pythonScript,
+          pythonCmd: options.pythonCmd,
+          installMpmath: options.installMpmath,
+          timeout: timeout
+        }, timeout),
+        timeout,
+        'limitAsync'
+      );
+    }
+
+    // 纯 JS 路径: 走 evaluate('limit(expr, var, point)'), 让 _evalLimit 处理
+    return withTimeout(new Promise(function (resolve, reject) {
+      try {
+        resolve(evaluate('limit(' + expr + ',' + varName + ',' + String(point) + ')'));
+      } catch (e) { reject(e); }
+    }), timeout, 'limitAsync');
+  }
+
   function registerFunction(name, fn /*, arity? */) {
     if (typeof name !== 'string') throw new TypeError('name must be a string');
     if (typeof fn !== 'function') throw new TypeError('fn must be a function');
@@ -1651,6 +2021,7 @@
     evaluateAsync: evaluateAsync,
     solve: solve,
     solveAsync: solveAsync,
+    limitAsync: limitAsync,
     // 扩展
     registerFunction: registerFunction,
     registerConstant: registerConstant,

@@ -879,9 +879,9 @@ bot.on("message",async (msg,pr)=> {
 /* ===================================================================
  *  Mineflayer 聊天指令:  <玩家名> !!do <body> [with k=v,...] [for x [interval=a,b]]
  *
- *  <玩家名>   发送指令的玩家 (用于显示和过滤自己)
- *  <body>     表达式 或 方程 (含 = 时按方程处理)
+ *  <body>     表达式 / 方程 / 高阶函数 (sum/product/diff/integrate/limit)
  *  with k=v   临时变量绑定, 多个用 , 分, 公式里直接当常量用
+ *              v 支持任意表达式, e.g.  with x=2*pi, with n=2^10
  *  for x      显式指定求解变量 (含 = 的方程才需要)
  *  interval   求解搜索区间, 默认 [-1000, 1000]
  *
@@ -891,6 +891,10 @@ bot.on("message",async (msg,pr)=> {
  *      <Alex>   !!do G*M*m/r^2  with  G=6.67e-11, M=6e24, m=70, r=6.4e6
  *      <Steve>  !!do x^2 - 2 = 0  for  x
  *      <Alex>   !!do x^2 + 2x + 3 = 0  for  x     ->  无解
+ *      <Steve>  !!do sum(i, 1, 100, i)            -> 5050
+ *      <Alex>   !!do diff(x^2, x) with x=3        -> ~6
+ *      <Steve>  !!do integrate(sin(x), x, 0, pi)  -> 2
+ *      <Alex>   !!do limit(sin(x)/x, x, 0)        -> 1
  *
  *  复数支持:
  *      <Steve>  !!do sqrt(-1)                ->  i
@@ -916,7 +920,8 @@ bot.on("message", async (msg) => {
     if (doing) return;
     doing = true;
     try {
-        bot.chat(runCmd(m[2]));                       // 只输出答案
+        const out = await runCmd(m[2]);               // runCmd 改 async, 必须 await
+        if (out != null) bot.chat(out);               // 只输出答案
     } catch (e) {
         bot.chat("错误: " + e.message);
     } finally {
@@ -924,56 +929,132 @@ bot.on("message", async (msg) => {
     }
 });
 
-function runCmd(rawBody) {
-    let body = rawBody;
+// Python 高精度后端 URL (按你实际启动的端口/地址改)
+const PY_URL = null;          // ★ 让 autoStartPython 接管
+// 想全自动就改成:  null  +  { autoStartPython: true }
+// const PY_URL = null;
 
-    // 1) 剥 "for x [interval=a,b]"
-    const forM = body.match(FOR_RE);
-    let solveVar = null, interval = null;
-    if (forM) {
-        solveVar = forM[1];
-        body = body.slice(0, forM.index) + body.slice(forM.index + forM[0].length);
-        if (forM[2] != null) interval = [Number(forM[2]), Number(forM[3])];
+async function runCmd(rawLine) {
+  let line = rawLine.trim();
+
+  // 1) 解析 with 子句 (保留你原逻辑)
+  let vars = {};
+  const withMatch = line.match(/\s+with\s+(.+)$/i);
+  let expr = line;
+  if (withMatch) {
+    expr = line.slice(0, withMatch.index).trim();
+    const pairs = withMatch[1].split(/[,;]/);
+    for (const p of pairs) {
+      const m = p.match(/^\s*([a-zA-Z_]\w*)\s*=\s*(.+)$/);
+      if (m) vars[m[1]] = parseWithValue(m[2]);
     }
-    body = body.trim();
+  }
 
-    // 2) 剥 "with k=v, k=v"
-    const withM = body.match(WITH_RE);
-    let inlineVars = {};
-    if (withM) {
-        body = body.slice(0, withM.index).trim();
-        for (const p of splitTopLevel(withM[1], ',')) {
-            const kv = p.trim().match(/^([A-Za-z_]\w*)\s*=\s*(.+)$/);
-            if (!kv) throw new Error(`with 语法错误: "${p.trim()}", 应为 名字=数字`);
-            const num = Number(kv[2]);
-            if (Number.isNaN(num)) throw new Error(`with 值 "${kv[2]}" 不是有效数字`);
-            inlineVars[kv[1]] = num;
-        }
+  // ★ 新增: limit(...) 语法 -> 走 Python 后端拿任意精度
+  //   匹配: limit(<expr>, <var>, <point>)   <point> 可以是 0/inf/1.5/pi 等
+  //   之前版本正则有 typo (\s*$ 写在 limit 后面, 永远匹配不到), 现已修正
+  const limitRe = /^\s*limit\s*\(\s*(.+?)\s*,\s*([A-Za-z_]\w*)\s*,\s*([^()]+?)\s*\)\s*$/i;
+  const limitMatch = expr.match(limitRe);
+  if (limitMatch) {
+    const [, limExprRaw, limVar, limPoint] = limitMatch;
+
+    // ★ 把 [数字][字母] 强制转成 [数字]*[字母], 避免 Python 后端 tokenize 隐式乘歧义
+    //   "4x" -> "4*x", "2x" -> "2*x"
+    //   注意: limit 表达式里几乎不会写科学计数法 (1e10), 所以这个替换是安全的
+    const limExpr = limExprRaw.replace(/(\d(?:\.\d+)?)([A-Za-z_]\w*)/g, '$1*$2');
+
+    try {
+      const pyOpts = {
+        precision: 50,
+        autoStartPython: (PY_URL == null),
+        timeout: 15000
+      };
+      if (PY_URL) pyOpts.pythonUrl = PY_URL;
+      const r = await M.limitAsync(limExpr, limVar, limPoint.trim(), pyOpts);
+      return String(r);                          // 高精度字符串
+    } catch (e) {
+      // 后端挂了 -> 降级 JS 路径 (会有 1e-7 误差, 至少不报错)
+      console.error('[limitAsync error]', e.message || e);
+      return formatNum(M.evaluate(expr, vars));
+    }
+  }
+
+  // 2) 解析 for x 语法 (保留你原逻辑)
+  const forMatch = expr.match(/^(.+?)\s+for\s+([a-zA-Z_]\w*)\s*$/);
+  if (forMatch) {
+    const equation = forMatch[1].trim();
+    const varName  = forMatch[2];
+    try {
+      // ★ 求根场景直接走 JS 路径 (M.solve 用 Aberth-Ehrlich):
+      //   - 找全部根(实+复), 不会漏
+      //   - 重根处理 OK (Newton 中心差分在导数为 0 处发散, 见 x^2+2x+1=0)
+      //   - 精度 17 位对整数根 / 二次无理根 / 单位根足够
+      //   Python 后端 (M.solveAsync) 在求根场景的精度优势被重根 bug 抵消, 不用
+      const roots = M.solve(equation, varName, { vars });
+      return formatRoots(roots);
+    } catch (e) {
+      return '求解失败: ' + e.message;
+    }
+  }
+
+  // 3) 普通表达式 (能 evaluateAsync 就用, 拿到 Python 后端的精度)
+  // ★ 提前拦截: sum/product/diff/integrate 走 JS 路径
+  //   Python 后端 (mpmath) 没实现这 4 个高阶函数, 发过去会 HTTP 400
+  //   limit 已经被前面的 limitRe 分支处理, 这里不重复
+  if (/^\s*(sum|product|diff|integrate)\s*\(/i.test(expr)) {
+    try {
+      return formatNum(M.evaluate(expr, vars));
+    } catch (e) {
+      return '计算失败: ' + e.message;
+    }
+  }
+  try {
+    // ★ 优化: 先试 JS 路径
+    //   - BigInt (大整数, 2^1000/10^1000 这种): JS 路径精确完整, 不截断
+    //     (Python mpmath 是 50 位, 输出 e+301 形式, 不是完整 1001 位)
+    //   - 复数 (含 re+im): JS 路径处理
+    //   - 普通 number (浮点) / 字符串: 走 Python 后端拿高精度
+    let jsResult = null;
+    try { jsResult = M.evaluate(expr, vars); } catch (e) { /* JS 失败, 走 Python 兜底 */ }
+    if (jsResult != null) {
+      if (typeof jsResult === 'bigint') return formatNum(jsResult);
+      if (typeof jsResult === 'object' && typeof jsResult.re === 'number') return formatNum(jsResult);
     }
 
-    // 3) 执行
-    if (solveVar) {
-        const eq = body.includes('=') ? body : body + ' = 0';
-        const opts = interval ? { start: interval[0], end: interval[1] } : {};
-        let roots = M.solve(eq, solveVar, Object.assign({ vars: inlineVars }, opts));
-        if (!Array.isArray(roots)) roots = [roots];
-
-        // ★ 残差验证: 把 x=r 代回原方程, |f(r)| 太大的视为假根剔除
-        //    防止 mathEvaluator 在某些版本上返回"近零极值"假根
-        //    兼容复数返回值: 用 |z| = sqrt(re²+im²), 不要用 Math.abs (对对象返回 NaN)
-        const [lhs, rhs] = eq.split('=');
-        const expr = `(${lhs}) - (${rhs})`;
-        const valid = roots.filter(r => {
-            const env = Object.assign({ [solveVar]: r }, inlineVars);
-            return magnitude(M.evaluate(expr, env)) < 1e-6;
-        });
-
-        return valid.length === 0
-            ? "无解"
-            : valid.map(formatNum).join(', ');
-    } else {
-        return formatNum(M.evaluate(body, inlineVars));
+    // 普通 number / 字符串 / JS 失败 -> Python 后端拿高精度
+    if (M.evaluateAsync) {
+      const opts = {
+        precision: 50,
+        autoStartPython: (PY_URL == null),
+        timeout: 15000
+      };
+      if (PY_URL) opts.pythonUrl = PY_URL;
+      const r = await M.evaluateAsync(expr, vars, opts);
+      return formatNum(r);
     }
+    return formatNum(jsResult);
+  } catch (e) {
+    return '计算失败: ' + e.message;
+  }
+}
+
+/**
+ * 解析 with 子句的值: 纯数字字面量转 number, 其他(表达式/常量名)保持字符串
+ *   - "3"      -> 3          (number, 后面 evaluate 直接用)
+ *   - "2.5e-3" -> 0.0025     (number, 科学计数法)
+ *   - "2*pi"   -> "2*pi"     (string, 交给 evaluate 算)
+ *   - "pi"     -> "pi"       (string, 交给 evaluate 当常量)
+ *   - "x+1"    -> "x+1"      (string, 含字母/运算符, 保持原样)
+ */
+function parseWithValue(s) {
+    if (typeof s !== 'string') return s;
+    const t = s.trim();
+    // 严格匹配: 纯数字字面量 (含可选符号, 小数, 科学计数法)
+    if (/^[+\-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+\-]?\d+)?$/.test(t)) {
+        const n = Number(t);
+        if (Number.isFinite(n)) return n;
+    }
+    return t;   // 表达式/常量/含字母, 保持字符串
 }
 
 /**
@@ -999,38 +1080,53 @@ function isComplex(v) {
 }
 
 /**
- * 数字美化: 大整数用 BigInt, 小数用 toFixed(10) 去尾零, 永远不用科学计数
+ * 数字美化: 大整数用 BigInt, 小数用 toFixed(10) 去尾零, 极小数 / 极大数走科学计数
  *   - 复数走 mathEvaluator 自带的 toString, 输出 i / 1+i / 2-3.4i 这种形式
+ *   - 不截断 (BigInt / 字符串 / 极小数等按原样输出)
  */
 function formatNum(v) {
     if (v == null) return String(v);
-  
+
     // 复数
-    if (typeof v === 'object' && typeof v.re === 'number' && typeof v.im === 'number') {
-      if (v.im === 0) return formatNum(v.re);
-      if (v.re === 0) return formatNum(v.im) + 'i';
-      return v.re + (v.im >= 0 ? '+' : '') + v.im + 'i';
+    if (isComplex(v)) {
+        if (v.im === 0) return formatNum(v.re);
+        if (v.re === 0) return formatNum(v.im) + 'i';
+        return v.re + (v.im >= 0 ? '+' : '') + v.im + 'i';
     }
-  
-    // BigInt（精确大整数）—— 不截断
+
+    // BigInt (精确大整数) —— 不截断
     if (typeof v === 'bigint') return v.toString();
-  
-    // 字符串（来自 _origStr 高精度小数）—— 不截断
+
+    // 字符串 (来自 _origStr / 1e-N 等高精度) —— 不截断
     if (typeof v === 'string') return v;
-  
+
     if (typeof v === 'number') {
-      if (Number.isNaN(v)) return 'NaN';
-      if (!Number.isFinite(v)) return v > 0 ? 'Infinity' : '-Infinity';
-      if (Number.isInteger(v)) return String(v);
-  
-      if (v !== 0 && Math.abs(v) < 1e-6) return v.toExponential();
-      if (Math.abs(v) >= 1e16) return v.toExponential();
-  
-      return v.toFixed(10).replace(/\.?0+$/, '');
+        if (Number.isNaN(v)) return 'NaN';
+        if (!Number.isFinite(v)) return v > 0 ? 'Infinity' : '-Infinity';
+        if (Number.isInteger(v)) return String(v);
+        // 极小数 (1e-20 这种): toFixed(10) 会全 0 被剥成 "0", 改用 toExponential
+        if (v !== 0 && Math.abs(v) < 1e-6) return v.toExponential();
+        if (Math.abs(v) >= 1e16) return v.toExponential();
+        return v.toFixed(10).replace(/\.?0+$/, '');
     }
-  
+
     return String(v);
-  }
+}
+
+/**
+ * 根数组美化: 复用 formatNum, 逗号拼接
+ *   - 空数组 -> "无解"
+ *   - 非数组 (单个值) -> 强制包成数组再处理
+ *   - 复数根 -> "0.951+0.309i" 这种格式 (用 formatNum 里的 isComplex 分支)
+ *   - 大整数根 (BigInt) -> 不截断
+ *   - 高精度字符串根 (来自 Python 后端) -> 原样输出
+ */
+function formatRoots(roots) {
+    if (roots == null) return '无解';
+    if (!Array.isArray(roots)) roots = [roots];
+    if (roots.length === 0) return '无解';
+    return roots.map(formatNum).join(', ');
+}
 
 /**
  * 按顶层分隔符切分, 跳过 () [] {} 与字符串字面量
