@@ -55,10 +55,25 @@ try:
         asin, acos, atan, atan2,
         sinh, cosh, tanh,
         exp, log, log10, sqrt, power,
-        limit,
-        pi, e, phi, inf, nan,
+        limit, quad, quadosc, nsum, nprod,
+        pi, e, phi, inf, nan, isfinite,
         floor as mpfloor, ceil as mpceil
     )
+    # r15: 加 gamma/erf (可选, 旧版 mpmath 可能没有)
+    try:
+        from mpmath import gamma as _mp_gamma
+    except ImportError:
+        _mp_gamma = None
+    try:
+        from mpmath import erf as _mp_erf
+    except ImportError:
+        _mp_erf = None
+    # r13: NoConvergence 用于 limit(..., exp=True) 失败时回退到 exp=False
+    try:
+        from mpmath import NoConvergence
+    except ImportError:
+        # 旧版 mpmath 可能用 mp.libmp.NoConvergence
+        from mpmath.libmp import NoConvergence
     tau = 2 * pi  # mpmath 没有内置 tau
     HAS_MPMATH = True
     try:
@@ -74,6 +89,8 @@ except Exception as _ex:
     def e(): return 2.718281828459045
     def tau(): return 6.283185307179586
     def phi(): return 1.618033988749895
+    class NoConvergence(Exception):
+        pass
 
 DEFAULT_PRECISION = 50
 
@@ -104,7 +121,17 @@ def setup_mpmath(precision):
         "floor": mpfloor, "ceil": mpceil,
         "min": min, "max": max,
         "fact": _factorial,
+        # r15: 加 fac/binom/double_fact/gamma/erf
+        "fac": _mp_fac,
+        "factorial": _mp_fac,
+        "double_fact": _double_fact,
+        "dfact": _double_fact,
+        "binom": _mp_binom,
     })
+    if _mp_gamma is not None:
+        _MP_FUNCTIONS["gamma"] = _mp_gamma
+    if _mp_erf is not None:
+        _MP_FUNCTIONS["erf"] = _mp_erf
 
 def _factorial(n):
     if n < 0 or n != int(n):
@@ -113,6 +140,143 @@ def _factorial(n):
     for i in range(2, int(n) + 1):
         r *= i
     return r
+
+# r15: 加 fac, binom, double_factorial, gamma (Γ), catalan (G) 等
+def _mp_fac(n):
+    """fac(n) = n! .  与 _factorial 区分: fac 是用户调用名."""
+    return _factorial(n)
+
+def _double_fact(n):
+    """n!! = n * (n-2) * (n-4) * ... * (n or 2).  r15 用于 Wallis 公式 (题目 100)."""
+    if n < 0 or n != int(n):
+        raise ValueError("n!! requires non-negative integer")
+    n = int(n)
+    r = 1
+    while n > 0:
+        r *= n
+        n -= 2
+    return r
+
+def _mp_binom(n, k):
+    """binom(n, k) = n! / (k! * (n-k)!).  r15 用于 Catalan 公式 (题目 11)."""
+    n_i = int(n) if n == int(n) else None
+    k_i = int(k) if k == int(k) else None
+    if n_i is None or k_i is None:
+        raise ValueError("binom() requires integer arguments")
+    if k_i < 0 or k_i > n_i:
+        return mpf(0)
+    # 用对数组合防 n 大时溢出
+    if k_i > n_i - k_i:
+        k_i = n_i - k_i
+    r = 1
+    for i in range(1, k_i + 1):
+        r = r * (n_i - k_i + i) // i
+    return mpf(r)
+
+# ---------- 高阶函数: sum / product / integrate ----------
+#   这些是 JS 端 evaluate 用的同名函数, Python 后端也要支持以便 limit
+#   等高阶表达式能 evaluate 极限.
+#
+#   sum(k, lo, hi, body)    ->  Σ_{k=lo}^{hi} body
+#   product(k, lo, hi, body) ->  Π_{k=lo}^{hi} body
+#   integrate(f, x, a, b)   ->  ∫_a^b f(x) dx
+#
+#   body/f 是字符串, 循环时通过 ast 重新求值 (复制 env, 注入 k/x)
+
+def _ast_eval_string(body_src, env):
+    """对字符串 body_src 重新 ast.parse 并求值, 复制 env."""
+    local_env = dict(env)
+    expr2 = _wrap_numbers_as_mpf(body_src)
+    expr2 = _insert_implicit_mul(expr2)
+    expr2 = _caret_to_pow(expr2)
+    expr2 = _doublebang_to_doublefact(expr2)  # r15: n!! => double_fact(n)
+    tree2 = ast.parse(expr2, mode="eval")
+    return _eval(tree2.body, local_env)
+
+# r14: 给 _py_sum / _py_product 复用, 一次性解析 body 为 AST, 避免内层循环每次重 parse
+#   性能关键: 嵌套 sum/product 嵌入 limit 时, mpmath.limit 调 f(k) k=1..N (N≈50-200),
+#   每个 f(k) 内层 k 次 sum 迭代, 不缓存 AST 则 ast.parse 总次数 = 1+2+...+N ≈ N²/2,
+#   在 N=200 时达 20100 次, 单次 ~100-500 μs, 总 2-10s 命中 JS 端 15s timeout.
+#   进一步: 调用方 (_eval sum/product 分支) 直接传 AST node, 跳过 ast.unparse 一次.
+def _coerce_body(body):
+    """r14: 接受 str 或 ast.AST, 统一返回 ast.AST node."""
+    if isinstance(body, ast.AST):
+        return body
+    if isinstance(body, str):
+        return _parse_body_ast(body)
+    raise TypeError("body must be str or ast.AST, got %s" % type(body).__name__)
+
+def _parse_body_ast(body_src):
+    """r14: 一次性把 body 字符串解析为 AST node, 给 sum/product 内层循环复用."""
+    e = _wrap_numbers_as_mpf(body_src)
+    e = _insert_implicit_mul(e)
+    e = _caret_to_pow(e)
+    e = _doublebang_to_doublefact(e)  # r15: n!! => double_fact(n)
+    return ast.parse(e, mode="eval").body
+
+def _to_int_mpf(x):
+    """把 mpf 转 int (要求是整数), 用于循环边界."""
+    if x != int(x):
+        raise ValueError("sum/product requires integer bounds (got %s)" % x)
+    return int(x)
+
+def _py_sum(var, lo, hi, body, env):
+    lo_i = _to_int_mpf(lo); hi_i = _to_int_mpf(hi)
+    if hi_i < lo_i:
+        return mpf(0)
+    # r14: 一次性解析 body 为 AST, inner loop 复用 (vs 之前每次迭代 ast.parse + ast.unparse)
+    body_ast = _coerce_body(body)
+    total = mpf(0)
+    for i in range(lo_i, hi_i + 1):
+        local_env = dict(env)
+        local_env[var] = mpf(i)
+        total += _eval(body_ast, local_env)
+    return total
+
+def _py_product(var, lo, hi, body, env):
+    lo_i = _to_int_mpf(lo); hi_i = _to_int_mpf(hi)
+    if hi_i < lo_i:
+        return mpf(1)
+    # r14: 同 _py_sum, 预解析 AST 避免内层重 parse
+    body_ast = _coerce_body(body)
+    total = mpf(1)
+    for i in range(lo_i, hi_i + 1):
+        local_env = dict(env)
+        local_env[var] = mpf(i)
+        total *= _eval(body_ast, local_env)
+    return total
+
+def _py_integrate(body, var, a, b, env):
+    # 用 mpmath.quad 数值积分, 内部以 var 替换 body 中的 var
+    def f(x):
+        local_env = dict(env)
+        local_env[var] = x
+        return _ast_eval_string(body, local_env)
+    # r15: 振荡积分 (sin/cos 在 [a,inf) 上) 走 quadosc 更精确
+    #   例: ∫₀^∞ sin(x)/x dx = π/2,  ∫₀^∞ x*sin(x)/(1+x^2) dx = π/2 * 1/e
+    #   普通 quad 截断到 ~50 处会给出错误结果 (7.31 而不是 π/2)
+    if (b == inf or b == float('inf')) and _is_oscillatory(body):
+        # quadosc: 需要 omega / period / zeros, 不指定具体周期时:
+        #   - omega=1 默认 1 Hz 振荡, 适用于 sin(x), sin(2x)*g(x) 等
+        #   - period=2*pi 同上 (2*pi/omega)
+        #   两者等价 (默认 omega=1, period=2*pi). 失败时回退到 quad
+        try:
+            return quadosc(f, [a, b], omega=1)
+        except Exception:
+            pass  # 回退到 quad
+    return quad(f, [a, b])
+
+# r15: 简单判定积分体是否振荡
+#   查找 sin( 或 cos( 后跟一个常数或 var
+import re as _re
+# 形式 1: sin(常数*x) 或 sin(x) (有 * 乘)
+_OSC_PAT1 = _re.compile(r'\b(sin|cos)\s*\([^)]*\)')
+# 形式 2: 单独的 sin(x) (无乘) - 在 [a,inf) 上也算振荡
+def _is_oscillatory(body):
+    """简单判断 body 字符串中是否含 sin(...) 或 cos(...) (含形参), 视为振荡函数"""
+    if _OSC_PAT1.search(body):
+        return True
+    return False
 
 # ---------- AST 求值 ----------
 _BIN = {
@@ -135,11 +299,9 @@ def _eval(node, env):
             #   mpf('0.1') -> 0.1 (按当前精度精确解析)
             return mpf(repr(node.value))
         raise ValueError("unsupported constant: %r" % (node.value,))
-    if hasattr(ast, "Num") and isinstance(node, ast.Num):  # py<3.8
-        # Num 节点的 n 可能是 int 或 float, float 也要走字符串
-        if isinstance(node.n, float):
-            return mpf(repr(node.n))
-        return mpf(node.n)
+    # r14: 移除 ast.Num 兼容分支.  Python 3.8+ 所有 numeric literals 都是 ast.Constant
+    #   (ast.Num 是 deprecated alias, isinstance 检查会触发 deprecation warning,
+    #    嵌套 sum 极限时 9 次/iter × 数万次 iter = 卡 15s).  现代 Python 走上面 ast.Constant 分支.
     if isinstance(node, ast.Name):
         if node.id in env:
             return env[node.id]
@@ -165,6 +327,54 @@ def _eval(node, env):
             if len(node.args) != 1 or not isinstance(node.args[0], ast.Constant):
                 raise ValueError("__mpf__() requires a single string literal")
             return mpf(node.args[0].value)
+        # ★ 高阶函数: sum/product/integrate 需要保留 body 字符串 (不预先 evaluate)
+        if fname == "sum" or fname == "product":
+            if len(node.args) != 4:
+                raise ValueError("%s() requires (var, lo, hi, body)" % fname)
+            # 第一个参数是变量名, 可以是 ast.Name (k) 或 ast.Constant ('k')
+            a0 = node.args[0]
+            if isinstance(a0, ast.Name):
+                var_name = a0.id
+            elif isinstance(a0, ast.Constant) and isinstance(a0.value, str):
+                var_name = a0.value
+            else:
+                raise ValueError("%s() first arg must be a variable name" % fname)
+            lo = _eval(node.args[1], env)
+            hi = _eval(node.args[2], env)
+            # r14: 直接传 body AST node, 跳过 ast.unparse + 重 parse 的开销
+            #   (嵌套 sum 极限时 _py_sum 每次被调都 unparse+parse 一遍, 50+ f calls × 200
+            #    内部 iter = 10000 次 unparse/parse 卡 15s)
+            if fname == "sum":
+                return _py_sum(var_name, lo, hi, node.args[3], env)
+            return _py_product(var_name, lo, hi, node.args[3], env)
+        if fname == "integrate":
+            if len(node.args) != 4:
+                raise ValueError("integrate() requires (f, x, a, b)")
+            a1 = node.args[1]
+            if isinstance(a1, ast.Name):
+                var_name = a1.id
+            elif isinstance(a1, ast.Constant) and isinstance(a1.value, str):
+                var_name = a1.value
+            else:
+                raise ValueError("integrate() second arg must be a variable name")
+            f_str = ast.unparse(node.args[0])
+            a = _eval(node.args[2], env)
+            b = _eval(node.args[3], env)
+            return _py_integrate(f_str, var_name, a, b, env)
+        # ★ 嵌套 limit(body, var, point) - 委托给 compute_limit
+        if fname == "limit":
+            if len(node.args) != 3:
+                raise ValueError("limit() requires (expr, var, point)")
+            a0 = node.args[1]
+            if isinstance(a0, ast.Name):
+                var_name = a0.id
+            elif isinstance(a0, ast.Constant) and isinstance(a0.value, str):
+                var_name = a0.value
+            else:
+                raise ValueError("limit() second arg must be a variable name")
+            body_str = ast.unparse(node.args[0])
+            point_str = ast.unparse(node.args[2])
+            return compute_limit(body_str, var_name, point_str, mp.dps)
         fn = _MP_FUNCTIONS.get(fname)
         if fn is None:
             raise ValueError("unknown function: " + fname)
@@ -187,6 +397,72 @@ def _caret_to_pow(src):
     return "".join(out)
 
 
+# r15: 把 n!! / (expr)!! 翻译为 double_fact(n) / double_fact((expr)).
+#   双阶乘在数学中是后缀算子, 应用到紧邻的"原子" (数字/标识符/平衡括号组).
+#   例: ((2*10)!!/(2*10-1)!!)**2 → ((double_fact((2*10))/double_fact((2*10-1)))**2
+_DOUBLE_BANG_TOKEN_RE = re.compile(r"!!")
+def _doublebang_to_doublefact(src):
+    """从 src 中找 !!, 向前回溯到原子边界 (数字/标识符/平衡括号) 起点, 替换为 double_fact(ATOM)."""
+    out = []
+    i = 0
+    n = len(src)
+    while i < n:
+        # 先看 !! 位置
+        m = _DOUBLE_BANG_TOKEN_RE.search(src, i)
+        if not m:
+            out.append(src[i:])
+            break
+        # 向前回溯找原子起点
+        j = m.start() - 1
+        # 先把 !! 前的空白跳回去, 找到真正的原子起点
+        # 优先级: (1) 紧跟 ) (2) 紧跟 NAME (3) 紧跟 NUMBER
+        # 但 j 指向 !! 前一字符
+        if j < 0:
+            # !! 在串首, 异常, 保留原文
+            out.append(src[i:m.end()])
+            i = m.end()
+            continue
+        c = src[j]
+        if c == ')':
+            # 平衡括号: 找匹配的 (
+            depth = 1
+            k = j - 1
+            while k >= 0 and depth > 0:
+                if src[k] == ')':
+                    depth += 1
+                elif src[k] == '(':
+                    depth -= 1
+                k -= 1
+            # k 指向 ( 的前一个字符, 原子起点 = k+1
+            atom_start = k + 1
+            atom = src[atom_start : j + 1]
+            out.append(src[i:atom_start])
+            out.append("double_fact(")
+            out.append(atom)
+            out.append(")")
+            i = m.end()
+            continue
+        # NAME 或 NUMBER: 回溯到非标识符字符
+        k = j
+        while k >= 0 and (src[k].isalnum() or src[k] == '_' or src[k] == '.'):
+            k -= 1
+        # 防止吞掉 __mpf__ 中的 __, 但 __ 不是标识符字符的边界 (是 _), 所以会一起回溯
+        # 这通常是对的, 因为 double_fact 整体作为函数调用, 不需要吞 __
+        atom_start = k + 1
+        atom = src[atom_start : j + 1]
+        if not atom:
+            # 没找到原子, 保留原文
+            out.append(src[i:m.end()])
+            i = m.end()
+            continue
+        out.append(src[i:atom_start])
+        out.append("double_fact(")
+        out.append(atom)
+        out.append(")")
+        i = m.end()
+    return "".join(out)
+
+
 # 数字字面量 (整数/小数/科学计数法) 的精确正则.
 #   不能用 ast.parse 后再改 value, 因为 1e114514 已经被 Python 转成 inf(float).
 #   必须在 ast.parse 之前, 把数字字面量包成 __mpf__("...") 函数调用,
@@ -194,10 +470,10 @@ def _caret_to_pow(src):
 #   ★ 注意: 捕获组必须包含整个数字字面量 (含可选科学计数法), 否则
 #     sub 替换时 \1 会漏掉 e114514 部分, 1e114514 被切成 1 + e114514.
 _NUMBER_RE = re.compile(
-    r"(?<![\w\.])"                            # 前面不是 word char / .
-    r"([+\-]?(?:\d+\.?\d*|\.\d+)"             # 整数/小数 (可带正负号)
-    r"(?:[eE][+\-]?\d+)?)"                    # 可选科学计数法 (含在捕获组内)
-    r"(?![\w\.])"                             # 后面不是 word char / .
+    r"(?<![\w\.'])"                           # 前面不是 word char / . / '  (防止包到字符串字面量内的数字)
+    r"((?:\d+\.?\d*|\.\d+)"                   # 整数/小数 (不带前导符号, 符号归一元运算符)
+    r"(?:[eE][+\-]?\d+)?)"                    # 可选科学计数法 (含在捕获组内, 指数符号保留)
+    r"(?![\w\.'])"                            # 后面不是 word char / . / '
 )
 
 
@@ -263,6 +539,7 @@ def evaluate_expression(expr, variables, precision):
     expr = _wrap_numbers_as_mpf(expr)   # ★ 先包数字字面量, 防 1e114514 变 inf
     expr = _insert_implicit_mul(expr)  # 隐式乘法 2x / (a)(b)
     expr = _caret_to_pow(expr)         # 前端 ^  =>  Python **
+    expr = _doublebang_to_doublefact(expr)  # r15: n!! => double_fact(n)
     env = dict(_MP_CONSTANTS)
     if variables:
         for k, v in variables.items():
@@ -294,6 +571,7 @@ def solve_equation(expr, variable, start, end, samples, epsilon, precision, vari
     expr = _to_equation_ast(expr)
     expr = _insert_implicit_mul(expr)  # 隐式乘法
     expr = _caret_to_pow(expr)         # 前端 ^  =>  Python **
+    expr = _doublebang_to_doublefact(expr)  # r15: n!! => double_fact(n)
     tree = ast.parse(expr, mode="eval")
     env = dict(_MP_CONSTANTS)
     if variables:
@@ -458,20 +736,26 @@ def solve_equation(expr, variable, start, end, samples, epsilon, precision, vari
     return out
 
 # ---------- 数值极限 ----------
-def compute_limit(expr, variable, point, precision):
+def compute_limit(expr, variable, point, precision, *, direction=0):
     """数值极限: 用 mpmath.limit 走任意精度 Richardson/Shanks 加速
 
     expr:    字符串,  例 "(1 + 1/x)^x"  或  "(2x + exp(4*x))^(1/x)"
+             也接受已经 __mpf__ 包装过的字符串 (从 _eval 递归调用时)
     variable: 字符串, 例 "x"
-    point:   字符串/数值, 接受 "0"  "1.5"  "inf"  "-inf"  "nan"
+    point:   字符串/数值/已包装 __mpf__ 字符串, 接受 "0"  "1.5"  "inf"  "-inf"  "nan"
     precision: 整数 dps
+    direction: 可选, -1 / 0 / +1 (默认 0 = 双侧). +1 = 从右侧趋近, -1 = 从左侧趋近.
+             0/1/-1 以外值抛 ValueError (由 /limit 端点转 HTTP 400).
     """
+    if direction not in (-1, 0, 1):
+        raise ValueError("direction must be -1, 0, or +1 (got %r)" % (direction,))
     if not HAS_MPMATH:
         raise RuntimeError("mpmath is not installed. Run: pip install mpmath")
     setup_mpmath(precision)
     expr = _wrap_numbers_as_mpf(expr)   # ★ 防 1e114514 变 inf
     expr = _insert_implicit_mul(expr)  # 隐式乘法
     expr = _caret_to_pow(expr)         # 前端 ^  =>  Python **
+    expr = _doublebang_to_doublefact(expr)  # r15: n!! => double_fact(n)
     tree = ast.parse(expr, mode="eval")
     env = dict(_MP_CONSTANTS)
 
@@ -480,10 +764,196 @@ def compute_limit(expr, variable, point, precision):
         return _eval(tree.body, env)
 
     # 把 point 解释为 mpf (支持 inf/-inf/nan)
-    pt = mpf(point)
-    # mpmath.limit 默认 direction=+1 (从右侧接近);
-    # point 有限时单侧即可, 双向也得到同样答案.
-    return limit(f, pt)
+    #   如果 point 已经是 __mpf__('xxx') 包装 (来自 _eval 嵌套调用), 先 evaluate
+    pt_str = point
+    if isinstance(pt_str, str) and pt_str.startswith("__mpf__("):
+        # 通过 _eval 求值得到 mpf
+        try:
+            pt_tree = ast.parse(pt_str, mode="eval")
+            pt = _eval(pt_tree.body, env)
+        except Exception:
+            pt = mpf('0')   # fallback
+    else:
+        pt = mpf(point)
+    # r13: 发散检测前移到 mpmath.limit 之前.
+    #   原因: mpmath.limit 默认 exp=False 线性采样对 0/0 类极限 (代数收敛) 收敛极慢,
+    #   而 exp=True 指数采样 (h=2^-k) 又对发散极限 (e.g. 1/x at 0+) 不友好:
+    #   exp=True 让 1/x 序列在 h=2^-k 时 f(2^-k) = 2^k 单调上升, 但 Richardson 仍可能
+    #   误收敛到 0 或有限值 (尤其是 50 位精度下).  所以发散检测先跑, 命中 ±∞ 直接返回.
+    #
+    #   复数情况 (e.g. x^x at 0-) 不判发散, 走 mpmath 估计.
+    #   pt 是 inf/-inf 时跳过 (1^∞ 类, e.g. (1+1/x)^x, 序列会从 inf 趋近 e, 误判为发散).
+    def _detect_divergence(side):
+        # pt 是 inf/-inf: 跳过 (会误判 1^∞ 极限为发散)
+        if not isfinite(pt): return None
+        # side: +1 (右) / -1 (左). 取 h=2^-10..2^-19 (10 个点)
+        seq = []
+        for n in range(10, 20):
+            try:
+                h = mpf(2) ** (-n)
+                v = f(pt + side * h)
+                if not isfinite(v):
+                    # 序列中某个点就是 inf/-inf/nan, 立即判 ±∞ (按方向 + sign(v))
+                    if hasattr(v, 'real') and v.real != 0:
+                        return mpf('inf') if v.real > 0 else mpf('-inf')
+                    if v == inf or v > 0: return mpf('inf')
+                    if v == -inf or v < 0: return mpf('-inf')
+                    return None
+                # 复数: 不参与发散检测
+                if hasattr(v, 'real') and hasattr(v, 'imag') and v.imag != 0:
+                    return None
+                seq.append(v)
+            except Exception:
+                return None
+        if len(seq) < 5: return None
+        # 检查严格单调 + 同号
+        growing = True
+        all_pos = True
+        all_neg = True
+        for i in range(len(seq) - 1):
+            if abs(seq[i+1]) <= 1.2 * abs(seq[i]): growing = False
+            if seq[i] < 0 or seq[i+1] < 0: all_pos = False
+            if seq[i] > 0 or seq[i+1] > 0: all_neg = False
+        if not growing: return None
+        maxAbs = max(abs(v) for v in seq)
+        if maxAbs < 1e3: return None
+        if all_pos: return mpf('inf')
+        if all_neg: return mpf('-inf')
+        return None
+
+    # r13: 发散检测先跑. 命中 ±∞ 直接返回, 不进 mpmath.limit.
+    if direction == 1:
+        div = _detect_divergence(1)
+        if div is not None: return div
+    elif direction == -1:
+        div = _detect_divergence(-1)
+        if div is not None: return div
+    elif direction == 0:
+        # 双侧: 一侧发散同号才返回 ±∞
+        divL = _detect_divergence(-1)
+        divR = _detect_divergence(1)
+        if divL is not None and divR is not None and divL == divR: return divL
+        # 一侧发散一侧不发散: 仍走 mpmath 估计 (数学上 DNE, 不强行给 ±∞)
+
+    # r13: mpmath.limit 默认 exp=True 指数采样, 让 0/0 类代数收敛极限 (e.g. x^x, x*ln(x) at 0)
+    #      一次外推就到 50 位精度.  失败 (NoConvergence 等) 时回退到 exp=False 线性采样.
+    #
+    # r14 修正: pt 是 inf/-inf 时强制 exp=False.  mpmath.limit 在 isinf 分支 base 是
+    #   g_base(k) = f((k+1)·sign(x)) (线性), 但 exp=True 会再套一层 g(k) = g_base(2^k) = f(2^k+1)
+    #   (看 extrapolation.py line 2103-2105).  这对嵌套 sum/product 是致命的:
+    #   f(n) 自身是 O(n) 求和, 在 50 位精度 adaptive_extrapolation 需要 k ≈ 40, 此时
+    #   f(2^40) 调 2^40 ≈ 1e12 次 sum 迭代, 永远 hang (不会 throw, 永远不会 fallback).
+    #   1^∞ 极限 (e.g. (1+1/x)^x at inf) 的 f 是 O(1) per call, exp=True 在 inf 也无害,
+    #   但线性采样同样给正确结果, 不需要冒险.  0/0 类 (e.g. x^x at 0+) exp=True 收益
+    #   仍保留, 因为 pt 是有限点.
+    exp_flag = True if isfinite(pt) else False
+    if direction == 0:
+        try:
+            result = limit(f, pt, exp=exp_flag)
+        except (NoConvergence, ValueError, ZeroDivisionError):
+            result = limit(f, pt, exp=False)   # fallback
+    else:
+        try:
+            result = limit(f, pt, direction=direction, exp=exp_flag)
+        except (NoConvergence, ValueError, ZeroDivisionError):
+            result = limit(f, pt, direction=direction, exp=False)   # fallback
+
+    return result
+
+# ---------- 数值无穷级数和 ----------
+def compute_nsum(expr, variable, start, precision):
+    """数值无穷级数: 用 mpmath.nsum 从 start 到 inf 求和.
+
+    expr:     字符串, 例 "(2/3)^k"  或  "1/k^2"
+    variable: 字符串, 例 "k"
+    start:    数字, 整数 (求和起点)
+    precision: 整数 dps
+
+    返回: mpmath mpf 数值
+    """
+    if not HAS_MPMATH:
+        raise RuntimeError("mpmath is not installed. Run: pip install mpmath")
+    setup_mpmath(precision)
+    expr = _wrap_numbers_as_mpf(expr)   # 防 1e114514 变 inf
+    expr = _insert_implicit_mul(expr)  # 隐式乘法
+    expr = _caret_to_pow(expr)         # 前端 ^  =>  Python **
+    expr = _doublebang_to_doublefact(expr)  # r15: n!! => double_fact(n)
+    tree = ast.parse(expr, mode="eval")
+    env = dict(_MP_CONSTANTS)
+
+    start_i = int(start)
+    if start_i != start:
+        raise ValueError("nsum start must be an integer (got %s)" % start)
+
+    def f(x):
+        env[variable] = x
+        return _eval(tree.body, env)
+
+    # mpmath.nsum 接受字符串 method (例如 'richardson' 是默认),
+    # 收敛时返回 mpf, 发散时抛异常
+    return nsum(f, [start_i, inf])
+
+
+def compute_nprod(expr, variable, start, precision):
+    """数值无穷乘积: 用 mpmath.nprod 从 start 到 inf 求积.  r15: 加给 product 自由上界/inf 上界走.
+
+    expr:     字符串, 例 "(n^3-1)/(n^3+1)"  或  "1 - 1/n^2"
+    variable: 字符串, 例 "n"
+    start:    数字, 整数 (乘积起点)
+    precision: 整数 dps
+
+    返回: mpmath mpf 数值
+    """
+    if not HAS_MPMATH:
+        raise RuntimeError("mpmath is not installed. Run: pip install mpmath")
+    setup_mpmath(precision)
+    expr = _wrap_numbers_as_mpf(expr)
+    expr = _insert_implicit_mul(expr)
+    expr = _caret_to_pow(expr)
+    expr = _doublebang_to_doublefact(expr)
+    tree = ast.parse(expr, mode="eval")
+    env = dict(_MP_CONSTANTS)
+
+    start_i = int(start)
+    if start_i != start:
+        raise ValueError("nprod start must be an integer (got %s)" % start)
+
+    def f(x):
+        env[variable] = x
+        return _eval(tree.body, env)
+
+    return nprod(f, [start_i, inf])
+
+def _format_mpc(value, imag_zero_tol=None):
+    """格式化 mpmath mpc 为字符串.  虚部绝对值 < imag_zero_tol 时视为 0.
+
+    imag_zero_tol 默认 mp.dps 位数下 1e-(dps-2) 级别, 即 < 1e-10 视为 0
+    (避免 mpmath 数值精度噪声出现 "1.5 + 1e-126j").
+
+    返回: 纯实数 -> "1.5",  复数 -> "(1.5 + 0.5j)" / "(1.5 - 0.5j)"
+    """
+    # mpc 检测: mpc 有 .real 和 .imag, mpf 没有 (只 mpf 只有 context).  也支持 Python built-in complex.
+    is_mpc = (hasattr(value, "real") and hasattr(value, "imag")
+              and not isinstance(value, (int, float)))
+    if is_mpc:
+        re = value.real
+        im = value.imag
+        if imag_zero_tol is None:
+            if HAS_MPMATH:
+                imag_zero_tol = mpf(10) ** (-(mp.dps - 2)) if mp.dps > 4 else mpf("1e-2")
+            else:
+                imag_zero_tol = 1e-10
+        try:
+            im_abs = abs(im)
+        except Exception:
+            im_abs = 0
+        if im_abs < imag_zero_tol:
+            return str(re)
+        sign = "+" if im >= 0 else "-"
+        return "(" + str(re) + " " + sign + " " + str(abs(im)) + "j)"
+    return str(value)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
@@ -531,7 +1001,7 @@ class Handler(BaseHTTPRequestHandler):
                     data.get("variables") or {},
                     int(data.get("precision", DEFAULT_PRECISION)),
                 )
-                self._send_json({"result": str(result)})
+                self._send_json({"result": _format_mpc(result)})
 
             elif path == "/solve":
                 opts = data.get("options", {})
@@ -545,16 +1015,49 @@ class Handler(BaseHTTPRequestHandler):
                     int(opts.get("precision", DEFAULT_PRECISION)),
                     variables=opts.get("variables") or {}
                 )
-                self._send_json({"result": [str(r) for r in roots]})
+                self._send_json({"result": [_format_mpc(r) for r in roots]})
 
             elif path == "/limit":
+                # r12: 解析可选 direction 字段 (-1, 0, +1), 默认 0 (双侧, 兼容 r3-r11)
+                dir_raw = data.get("direction", 0)
+                try:
+                    direction = int(dir_raw)
+                except (TypeError, ValueError):
+                    self._send_json({
+                        "error": "direction must be -1, 0, or +1 (got %r)" % (dir_raw,)
+                    }, 400)
+                    return
+                if direction not in (-1, 0, 1):
+                    self._send_json({
+                        "error": "direction must be -1, 0, or +1 (got %r)" % (direction,)
+                    }, 400)
+                    return
                 result = compute_limit(
                     data.get("expression", ""),
                     data.get("variable", "x"),
                     str(data.get("point", "0")),
+                    int(data.get("precision", DEFAULT_PRECISION)),
+                    direction=direction
+                )
+                self._send_json({"result": _format_mpc(result), "direction": direction})
+
+            elif path == "/nsum":
+                result = compute_nsum(
+                    data.get("expression", ""),
+                    data.get("variable", "k"),
+                    float(data.get("start", 0)),
                     int(data.get("precision", DEFAULT_PRECISION))
                 )
-                self._send_json({"result": str(result)})
+                self._send_json({"result": _format_mpc(result)})
+
+            elif path == "/nprod":  # r15: 无穷乘积
+                result = compute_nprod(
+                    data.get("expression", ""),
+                    data.get("variable", "n"),
+                    float(data.get("start", 1)),
+                    int(data.get("precision", DEFAULT_PRECISION))
+                )
+                self._send_json({"result": _format_mpc(result)})
 
             else:
                 self._send_json({"error": "not found"}, 404)
@@ -576,12 +1079,19 @@ def main():
         print("       安装:  pip install mpmath")
         print("=" * 60)
 
-    server = HTTPServer((host, port), Handler)
+    # ★ 允许端口复用, 避免 Windows TIME_WAIT 状态导致 bind 失败
+    # ★ 用 ThreadingMixIn 让多请求并发处理, 避免前一个慢请求阻塞后一个
+    from socketserver import ThreadingMixIn
+    class ReuseTCPServer(ThreadingMixIn, HTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+    server = ReuseTCPServer((host, port), Handler)
     print("Precision math server listening on http://%s:%d" % (host, port))
     print("  GET  /health")
     print("  POST /evaluate  {expression, variables, precision}")
     print("  POST /solve     {expression, variable, options}")
     print("  POST /limit     {expression, variable, point, precision}")
+    print("  POST /nsum      {expression, variable, start, precision}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
