@@ -2231,8 +2231,11 @@
         const rp = _precedence(ast.right);
         const l = _astToString(ast.left);
         const r = _astToString(ast.right);
-        // 左操作数: 优先级更低才加括号
-        let left = (lp < myP || (lp === myP && (ast.op === '-' || ast.op === '/' || ast.op === '^')))
+        // ★ r15-amend8: 幂运算 (^) 左操作数是 unary (负号/正号) 时强制加括号
+        //   避免 (-1)^n 被序列化为 -1^n (Python 解析 -1^n 为 -(1^n) 而非 (-1)^n)
+        const forceLeftParen = (ast.op === '^' && ast.left && ast.left.type === 'unary');
+        // 左操作数: 优先级更低才加括号, 或 ^ 的左 unary 必须加括号
+        let left = (lp < myP || (lp === myP && (ast.op === '-' || ast.op === '/' || ast.op === '^')) || forceLeftParen)
           ? '(' + l + ')' : l;
         // 右操作数: 优先级更低, 或同级 (减/除/幂右结合) 时加括号
         let right = (rp < myP || (rp === myP && (ast.op === '-' || ast.op === '/' || ast.op === '^')))
@@ -4063,7 +4066,20 @@
         body: JSON.stringify(body),
         signal: controller ? controller.signal : undefined
       });
-      if (!r.ok) throw new Error('Python backend HTTP ' + r.status);
+      if (!r.ok) {
+        // ★ r15-amend6: 提取响应体中的 error 字段, 让 bot 能显示 Python 端的真实错误
+        //   (例如 "nsum divergent series: ..."), 而不是无信息的 "HTTP 400"
+        let errBody = '';
+        try { errBody = await r.text(); } catch (_) {}
+        let errMsg = 'Python backend HTTP ' + r.status;
+        if (errBody) {
+          try {
+            const parsed = JSON.parse(errBody);
+            if (parsed && parsed.error) errMsg = 'Python backend: ' + parsed.error.split('\n')[0];
+          } catch (_) { errMsg += ' (' + errBody.substring(0, 200) + ')'; }
+        }
+        throw new Error(errMsg);
+      }
       const data = await r.json();
       if (data && data.error) throw new Error('Python backend: ' + data.error);
       return data.result;
@@ -4954,9 +4970,48 @@
       }
 
       // --- 空白/间隔符 (\, \; \: \! ~ \\ + 空格): 删除 ---
-      //   也包括 \left, \right, \big, \Big, \bigg, \Bigg (LaTeX 括号尺寸, 不需保留)
-      if (cmd === ',' || cmd === ';' || cmd === ':' || cmd === '!' || cmd === ' ' || cmd === 'quad' || cmd === 'qquad'
-          || cmd === 'left' || cmd === 'right' || cmd === 'big' || cmd === 'Big' || cmd === 'bigg' || cmd === 'Bigg') {
+      //   也包括 \big, \Big, \bigg, \Bigg (LaTeX 括号尺寸, 不需保留)
+      //   ★ r15-amend7: \left / \right 是配对括号尺寸, 输出匹配的开/闭括号字符
+      //     \left[ ... \right] -> ( ... )  (方括号是视觉装饰, 转圆括号)
+      //     \left( ... \right) -> ( ... )
+      //     \left| ... \right| -> | ... |
+      //     \left\{ ... \right\} -> { ... }
+      //     \left. / \right. 单点变体 -> 不输出 (开区间记号, 删命令保留 .)
+      if (cmd === ',' || cmd === ';' || cmd === ':' || cmd === '!' || cmd === ' ' || cmd === 'quad' || cmd === 'qquad') {
+        return { text: '' };
+      }
+      if (cmd === 'big' || cmd === 'Big' || cmd === 'bigg' || cmd === 'Bigg') {
+        // \big 系列不强制配对, 不删括号
+        return { text: '' };
+      }
+      if (cmd === 'left') {
+        skipWs();
+        if (pos >= src.length) return { text: '' };
+        const b = src[pos];
+        if (b === '.') {
+          // \left. 单点变体: 删命令, 保留 . (用于开区间)
+          return { text: '' };
+        }
+        pos++;   // 消耗 1 个括号字符
+        // \left[ 转 (,  \left( 转 (,  \left| 转 |,  \left\{ 转 {
+        if (b === '[' || b === '(') return { text: '(' };
+        if (b === '|') return { text: '|' };
+        if (b === '{') return { text: '{' };
+        return { text: '' };
+      }
+      if (cmd === 'right') {
+        skipWs();
+        if (pos >= src.length) return { text: '' };
+        const b = src[pos];
+        if (b === '.') {
+          // \right. 单点变体: 删命令, 保留 .
+          return { text: '' };
+        }
+        pos++;
+        // \right] 转 ),  \right) 转 ),  \right| 转 |,  \right\} 转 }
+        if (b === ']' || b === ')') return { text: ')' };
+        if (b === '|') return { text: '|' };
+        if (b === '}') return { text: '}' };
         return { text: '' };
       }
 

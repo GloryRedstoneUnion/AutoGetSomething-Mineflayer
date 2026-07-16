@@ -861,6 +861,41 @@ def compute_limit(expr, variable, point, precision, *, direction=0):
     return result
 
 # ---------- 数值无穷级数和 ----------
+# ★ r15-amend6: 发散预检测. mpmath.nsum 对发散级数静默返部分和 (maxterms 项累加),
+#   不抛异常. 用项趋于 0 测试做预检测: 抽样 3 个点 (i=start+100, +1000, +10000) 算 |f(i)|,
+#   若都 > 0.5 且不下降, 视为发散, 抛 ValueError. 让 bot 端 catch 后能显示 "nsum 失败: ... 发散"
+#   而不是错误地返 550.0 / 150.0 等部分和.
+def _nsum_check_divergence(f, start_i, env, variable, sample_offsets=(100, 1000, 10000), threshold=mpf('0.5')):
+    """抽样检测级数项 |f(i)| 是否随 i -> inf 趋于 0. 若不趋于 0, 抛 ValueError.
+    threshold: 项绝对值下限, 若所有抽样点都 > threshold, 视为发散.
+
+    检测范围 (r15-amend6):
+      - f(i) = 1, 2, ... (常数): caught (项不趋于 0)
+      - f(i) = i, i^2, ... (多项式): caught (项增长)
+      - f(i) = (-1)^i, sin(i), ... (有界不收敛): caught (项不趋于 0)
+    已知未覆盖 (留待 r15-amend7+):
+      - f(i) = 1/i, 1/sqrt(i) (harmonic 类, 项趋于 0 但 ∑ 发散) -> 仍返部分和
+    """
+    samples = []
+    for off in sample_offsets:
+        try:
+            env[variable] = start_i + off
+            val = abs(f(start_i + off))
+        except Exception:
+            # 抽样点求值失败 (例如 1/0), 不据此判发散, 让 nsum 自己去处理
+            return
+        samples.append(val)
+    # 全 > 阈值 -> 项不趋于 0 -> 发散
+    if all(s > threshold for s in samples):
+        raise ValueError(
+            "nsum divergent series: term |f(i)| does not tend to 0 "
+            "(sampled |f(%d)|=%g, |f(%d)|=%g, |f(%d)|=%g, all > %s)"
+            % (start_i + sample_offsets[0], float(samples[0]),
+               start_i + sample_offsets[1], float(samples[1]),
+               start_i + sample_offsets[2], float(samples[2]),
+               float(threshold))
+        )
+
 def compute_nsum(expr, variable, start, precision):
     """数值无穷级数: 用 mpmath.nsum 从 start 到 inf 求和.
 
@@ -870,6 +905,7 @@ def compute_nsum(expr, variable, start, precision):
     precision: 整数 dps
 
     返回: mpmath mpf 数值
+    抛出: ValueError 当级数发散 (r15-amend6) 或 mpmath.nsum 内部错误
     """
     if not HAS_MPMATH:
         raise RuntimeError("mpmath is not installed. Run: pip install mpmath")
@@ -888,6 +924,11 @@ def compute_nsum(expr, variable, start, precision):
     def f(x):
         env[variable] = x
         return _eval(tree.body, env)
+
+    # ★ r15-amend6: 发散预检测 (项 |f(i)| -> 0 检测). mpmath.nsum 对发散级数静默返部分和,
+    #   此预检测在 nsum 之前先抽样验证项是否趋于 0, 若不趋于 0 则抛 ValueError.
+    #   注: 检查在 nsum 之前, 不要破坏 env 状态 (让后续 nsum 自己设 env[variable])
+    _nsum_check_divergence(f, start_i, env, variable)
 
     # mpmath.nsum 接受字符串 method (例如 'richardson' 是默认),
     # 收敛时返回 mpf, 发散时抛异常
