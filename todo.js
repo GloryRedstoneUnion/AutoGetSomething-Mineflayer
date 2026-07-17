@@ -1171,6 +1171,7 @@ async function runCmd(rawLine) {
               timeout: 15000
             };
             if (PY_URL) pyOpts.pythonUrl = PY_URL;
+            // TODO: nsumAsync does not yet accept vars (mathEvaluator.js signature has no vars param)
             const r = await M.nsumAsync(varName, fromI, bodyStr, pyOpts);
             return String(r);
           } catch (e2) {
@@ -1193,7 +1194,7 @@ async function runCmd(rawLine) {
               timeout: 15000
             };
             if (PY_URL) pyOpts.pythonUrl = PY_URL;
-            const r = await M.nprodAsync(varName, fromI, bodyStr, pyOpts);
+            const r = await M.nprodAsync(varName, fromI, bodyStr, pyOpts, vars);
             return String(r);
           } catch (e2) {
             return 'nprod 失败: ' + (e2.message || e2);
@@ -1216,6 +1217,7 @@ async function runCmd(rawLine) {
               timeout: 15000
             };
             if (PY_URL) pyOpts.pythonUrl = PY_URL;
+            // TODO: integrateAsync does not yet accept vars (mathEvaluator.js signature has no vars param)
             const r = await M.integrateAsync(bodyStr, varName, aStr, bStr, pyOpts);
             return String(r);
           } catch (e2) {

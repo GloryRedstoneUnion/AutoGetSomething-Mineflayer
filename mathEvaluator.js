@@ -828,10 +828,14 @@
     // ★ 上界是无穷 (Infinity / -Infinity) -> 抛特殊错误, 让 bot 调 nsumAsync (走 Python mpmath.nsum)
     //   错误格式: __NSUM_INF__:<varName>:<from>:<encodedBody>
     //   bot 端 catch 后解析, 调 M.nsumAsync(varName, from, body, {autoStartPython: true})
-    if (toRaw === Infinity || toRaw === -Infinity) {
-      const fromI = _toBigIntRange(fromRaw, 'sum 下界');
+    //   ★ r15-amend9 Bug 4.1: 扩展 Infinity 检查含 fromRaw (之前 fromRaw=-Infinity 走到 _toBigIntRange 抛错).
+    //     fromRaw 是 ±Infinity 时用 _normalizeInfBound 传 'inf'/'-inf' 字符串, bot 透传给 nsumAsync.
+    if (toRaw === Infinity || toRaw === -Infinity || fromRaw === Infinity || fromRaw === -Infinity) {
+      const fromField = (fromRaw === Infinity || fromRaw === -Infinity)
+        ? _normalizeInfBound(fromRaw)
+        : String(_toBigIntRange(fromRaw, 'sum 下界'));
       const bodyStr = _astToString(exprAst);
-      throw new Error('__NSUM_INF__:' + varName + ':' + fromI + ':' + encodeURIComponent(bodyStr));
+      throw new Error('__NSUM_INF__:' + varName + ':' + fromField + ':' + encodeURIComponent(bodyStr));
     }
     // 上界是非整数浮点 -> 也走 symbolic
     if (typeof toRaw === 'number' && !Number.isInteger(toRaw)) {
@@ -921,10 +925,13 @@
     //   r15: 之前这里抛 __PRODUCT_SYMBOUND__ 让 bot 走 symbolicProduct, 但 symbolicProduct
     //   不能给具体数值 (e.g. ∏(1-1/n^2) = sinh(π)/π ≈ 3.676). 改用数值路径
     //   错误格式: __NPROD_INF__:<var>:<from>:<encodedBody>
-    if (toRaw === Infinity || toRaw === -Infinity) {
-      const fromI = _toBigIntRange(fromRaw, 'product 下界');
+    //   ★ r15-amend9 Bug 4.1: 扩展 Infinity 检查含 fromRaw (同 _evalSum).
+    if (toRaw === Infinity || toRaw === -Infinity || fromRaw === Infinity || fromRaw === -Infinity) {
+      const fromField = (fromRaw === Infinity || fromRaw === -Infinity)
+        ? _normalizeInfBound(fromRaw)
+        : String(_toBigIntRange(fromRaw, 'product 下界'));
       const bodyStr = _astToString(exprAst);
-      throw new Error('__NPROD_INF__:' + varName + ':' + fromI + ':' + encodeURIComponent(bodyStr));
+      throw new Error('__NPROD_INF__:' + varName + ':' + fromField + ':' + encodeURIComponent(bodyStr));
     }
     // 上界是非整数浮点 -> 走 symbolic
     if (typeof toRaw === 'number' && !Number.isInteger(toRaw)) {
@@ -2083,10 +2090,25 @@
                   const e = Number(x.right.value);
                   powerMap.set(x.left.name, (powerMap.get(x.left.name) || 0) + e);
                 } else {
-                  others.push(x);
-                }
-              } else if (v.type === 'unary' && v.op === '-') {
-                // unary -:  把 -1 折进 consts, 处理 operand
+                others.push(x);
+              }
+            } else if (v.type === 'binop' && v.op === '/' && _isConstNum(v.left) &&
+                       (v.right.type === 'var' ||
+                        (v.right.type === 'binop' && v.right.op === '^' &&
+                         v.right.left.type === 'var' && _isConstNum(v.right.right)))) {
+              // ★ Bug 96(b) 修复: c / X (c 为常数分子, X 为 var 或 var^const) -> c 折进 consts, X 折成负幂次
+              //   例: 1/x -> consts=[1], powerMap[x] -= 1  (与 x 配对抵消: x*(1/x) = 1)
+              //   例: 2/x^3 -> consts=[2], powerMap[x] -= 3
+              //   之前漏处理此模式, 导致 2*x*(1/x) 不化简为 2, 二阶导出错
+              consts.push(Number(v.left.value));
+              if (v.right.type === 'var') {
+                powerMap.set(v.right.name, (powerMap.get(v.right.name) || 0) - 1);
+              } else {
+                const e = Number(v.right.right.value);
+                powerMap.set(v.right.left.name, (powerMap.get(v.right.left.name) || 0) - e);
+              }
+            } else if (v.type === 'unary' && v.op === '-') {
+              // unary -:  把 -1 折进 consts, 处理 operand
                 consts.push(-1);
                 const x = v.operand;
                 if (x.type === 'var') {
@@ -2222,7 +2244,14 @@
           if (ast.op === '-') return '-(' + inner + ')';
           if (ast.op === '+') return '+(' + inner + ')';
         }
-        if (ast.op === '!') return inner + '!';
+        // ★ r15-amend10 (Bug 29): 阶乘 (!) 作用于 binop/unary 时必须加括号
+        //   否则 (2*n+1)! 序列化为 2n+1!, ! 只绑定到 1 (factorial(1)) 而非整体
+        if (ast.op === '!') {
+          if (ast.operand.type === 'binop' || ast.operand.type === 'unary') {
+            return '(' + inner + ')!';
+          }
+          return inner + '!';
+        }
         return (ast.op === '-' ? '-' : '+') + inner;
       }
       case 'binop': {
@@ -2258,13 +2287,27 @@
             if (ast.right && ast.right.type === 'binop' && ast.right.op === '^') {
               return left + '*' + right;   // 必须保留 *
             }
+            // ★ r15-amend9 Bug 1.2: right 是阶乘时必须保留 *, 否则 2*3! → 23! 被解析为 factorial(23)
+            if (ast.right && ast.right.type === 'unary' && ast.right.op === '!') {
+              return left + '*' + right;
+            }
+            // ★ r15-amend9 Bug 1.1: right 以 +/- 开头时必须保留 *, 否则 2*(-x) → 2-x 被解析为减法
+            if (/^[+-]/.test(right)) {
+              return left + '*' + right;
+            }
             return left + right;
           }
           // 规则 2: right 起始是已知函数, 省略 *
+          //   ★ Bug 74 修复: 仅当 left 末尾不是字母/下划线时才省略 *
+          //     left 末尾是字母时 (如 x, 2x 中的 x), 省略 * 会拼成 xsin(x)/2xsin(x)
+          //     被误读为多字母变量名; left 末尾是数字 (2) 或右括号 ) 时省略 * 安全
           if (rightStart && /[a-zA-Z]/.test(rightStart)) {
             const fnMatch = right.match(/^([A-Za-z_][A-Za-z0-9_]*)\(/);
             if (fnMatch && Object.prototype.hasOwnProperty.call(FUNCTIONS, fnMatch[1])) {
-              return left + right;
+              if (!/[a-zA-Z_]$/.test(left)) {
+                return left + right;   // left 末尾非字母 (数字/右括号等), 省略 * 安全
+              }
+              // left 末尾是字母, 落到规则 3 保留 *
             }
           }
           // 规则 3: letter-letter 拼接可能产生多字母变量歧义, 保留 *
@@ -3496,8 +3539,9 @@
     // Aberth-Ehrlich 迭代
     const TOL = 1e-12;
     const MAX_ITER = 60;
+    let maxChange = 0;  // ★ r15-amend9 Bug 7.1: 提升到循环外, 便于循环后检查收敛
     for (let iter = 0; iter < MAX_ITER; iter++) {
-      let maxChange = 0;
+      maxChange = 0;
       const next = [];
       for (let i = 0; i < n; i++) {
         const fz = f(z[i]);
@@ -3527,6 +3571,11 @@
       }
       for (let i = 0; i < n; i++) z[i] = next[i];
       if (maxChange < TOL) break;
+    }
+
+    // ★ r15-amend9 Bug 7.1: 60 次迭代未收敛时 console.warn (不抛错避免破坏现有行为)
+    if (maxChange >= TOL) {
+      console.warn('Aberth-Ehrlich did not converge: maxChange=' + maxChange + ' (TOL=' + TOL + ')');
     }
 
     // 去重 (理论上 AE 不会让两个起点收敛到同一点, 但保险)
@@ -4063,7 +4112,8 @@
       const r = await fetch(base + path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        // ★ r15-amend9 Bug 5.2: vars 含 BigInt 时 JSON.stringify 抛 TypeError, 用 replacer 转 string
+        body: JSON.stringify(body, function (k, v) { return typeof v === 'bigint' ? v.toString() : v; }),
         signal: controller ? controller.signal : undefined
       });
       if (!r.ok) {
@@ -4211,6 +4261,27 @@
           let m = src.slice(p).match(/^[A-Za-z]+/);
           if (m) p += m[0].length;
           else p++;   // 单字符命令
+          // ★ Bug 55: \left( / \right) 需要跟踪括号深度, 否则 \left(...\right) 内的 +/- 会被误判为顶层
+          if (m && (m[0] === 'left' || m[0] === 'LEFT')) {
+            while (p < endPos && /\s/.test(src[p])) p++;
+            if (p < endPos) {
+              const b = src[p];
+              if (b === '(' || b === '[') { depthParen++; p++; continue; }
+              if (b === '{') { depthBrace++; p++; continue; }
+              p++; continue;  // \left| 或 \left. 不影响深度
+            }
+            continue;
+          }
+          if (m && (m[0] === 'right' || m[0] === 'RIGHT')) {
+            while (p < endPos && /\s/.test(src[p])) p++;
+            if (p < endPos) {
+              const b = src[p];
+              if (b === ')' || b === ']') { depthParen--; p++; continue; }
+              if (b === '}') { depthBrace--; p++; continue; }
+              p++; continue;  // \right| 或 \right. 不影响深度
+            }
+            continue;
+          }
           // 跳过命令后的可选参数
           while (p < endPos) {
             while (p < endPos && /\s/.test(src[p])) p++;
@@ -5119,7 +5190,18 @@
             }
           }
           // 不是裸函数: 把 word 整个加到 out (留给 known-id 步骤处理)
-          out += word;
+          // ★ Bug 11 修复: word 后面紧跟 \left( 时, word 不是已知函数, 插入 *
+          //   避免 x\left(...\right) 被转为 x(...) 误读为函数调用
+          if (next === '\\' && q < src.length) {
+            const cmdMatch = src.slice(q + 1).match(/^[A-Za-z]+/);
+            if (cmdMatch && cmdMatch[0].toLowerCase() === 'left') {
+              out += word + '*';
+            } else {
+              out += word;
+            }
+          } else {
+            out += word;
+          }
         } else {
           out += c; pos++;
         }
@@ -5331,10 +5413,13 @@
 
     if (usePython) {
       // Python 后端: 走 mpmath.limit, 任意精度
+      // ★ Bug 11 修复: 把 Infinity/-Infinity/'Infinity' 等归一化为 inf/-inf
+      //   Python mpmath 只识 inf/-inf, 不识 JS 的 'Infinity' (String(Infinity)='Infinity')
+      //   之前未归一化导致 Python 端收到 'Infinity' 返回 NaN/报错
       const body = {
         expression: expr,
         variable: varName,
-        point: String(point),
+        point: _normalizeInfBound(point),
         precision: options.precision || config.defaultPrecision,
         pythonUrl: options.pythonUrl,
         autoStartPython: !!(options.autoStartPython || config.pythonAutoStart),
@@ -5354,13 +5439,15 @@
     }
 
     // 纯 JS 路径: 走 evaluate('limit(expr, var, point[, direction])'), 让 _evalLimit 处理
+    // ★ Bug 11: JS 路径也归一化 Infinity -> inf, 保持与 Python 路径一致
+    const ptNorm = _normalizeInfBound(point);
     let limitStr;
     if (direction != null) {
       // 4-arg: 拼 'limit(expr, var, point, +1/-1/0)'
       const dirStr = direction > 0 ? '+1' : (direction < 0 ? '-1' : '0');
-      limitStr = 'limit(' + expr + ',' + varName + ',' + String(point) + ',' + dirStr + ')';
+      limitStr = 'limit(' + expr + ',' + varName + ',' + ptNorm + ',' + dirStr + ')';
     } else {
-      limitStr = 'limit(' + expr + ',' + varName + ',' + String(point) + ')';
+      limitStr = 'limit(' + expr + ',' + varName + ',' + ptNorm + ')';
     }
     return withTimeout(new Promise(function (resolve, reject) {
       try {
@@ -5372,62 +5459,69 @@
   // ★ r15-amend3: 把 JS 阶乘语法 n! 翻译为 Python factorial(n).
   //   Python mpmath 不识 `!` 后缀算子 (不是合法 Python 语法, ast.parse 会 SyntaxError -> HTTP 400).
   //   Python 端已有 _doublebang_to_doublefact 处理 n!! (双阶乘), 但漏了 n! (单阶乘).
-  //   修复在 JS→Python 边界: 扫 body 找所有 ! (确保不是 !!), 向前回溯到原子 (NAME/NUMBER/平衡括号),
-  //   替换为 factorial(ATOM). 反向处理避免索引失效.
+  //   修复在 JS→Python 边界: 扫 body 找单 ! (确保不是 !!), 向前回溯到原子 (NAME/NUMBER/平衡括号),
+  //   替换为 factorial(ATOM).
   //   例:  n! -> factorial(n);  (n+1)! -> factorial((n+1));  n!! 不动 (留给 Python 端)
+  //   ★ r15-amend9 Bug 6.1: 旧实现一次性收集所有 ! 位置, 但外层 ! 的原子范围可能含内层 ! 位置;
+  //     外层替换后 result 长度变化, 内层 ! 的原始位置失效, 产出非法 Python (如 (n!)! -> factorial(fa)torial((n!)) ).
+  //     改为: 每次替换后重新扫描 result 找第一个单 !, 用 scanFrom 游标跳过无法回溯原子的 ! (如 !! 的尾部).
   function _toPythonBody(body) {
     if (typeof body !== 'string' || body.length === 0) return body;
-    const n = body.length;
-    // 第一步: 找所有单 ! (确保它后面不跟 !) 的位置
-    const positions = [];
-    for (let i = 0; i < n; i++) {
-      if (body.charCodeAt(i) === 33 /* '!' */ && body.charCodeAt(i + 1) !== 33) {
-        positions.push(i);
-      }
-    }
-    if (positions.length === 0) return body;
-    // 反向处理 (从后往前), 这样 substring 不会让前面已替换的位置失效
     let result = body;
-    for (let p = positions.length - 1; p >= 0; p--) {
-      const i = positions[p];
-      // 向前回溯找原子起点 (跳过空白)
-      let j = i - 1;
-      while (j >= 0 && (result.charCodeAt(j) === 32 || result.charCodeAt(j) === 9)) j--;
-      if (j < 0) continue;  // ! 之前没东西, 跳过 (防御)
-      const c = result.charCodeAt(j);
-      let atomStart, atom;
-      if (c === 41 /* ')' */) {
-        // 平衡括号: 找匹配的 (
-        let depth = 1;
-        let k = j - 1;
-        while (k >= 0 && depth > 0) {
-          const ck = result.charCodeAt(k);
-          if (ck === 41) depth++;
-          else if (ck === 40) depth--;
-          k--;
+    let scanFrom = 0;
+    let guard = 0;
+    while (guard++ < 200) {
+      // 找第一个单 ! (非 !!)
+      let idx = -1;
+      for (let i = scanFrom; i < result.length; i++) {
+        if (result.charCodeAt(i) === 33 /* '!' */ && result.charCodeAt(i + 1) !== 33) {
+          idx = i;
+          break;
         }
-        atomStart = k + 1;
-        atom = result.substring(atomStart, j + 1);
-      } else if ((c >= 48 && c <= 57) /* 0-9 */ ||
-                 (c >= 65 && c <= 90)  /* A-Z */ ||
-                 (c >= 97 && c <= 122) /* a-z */ ||
-                 c === 95 /* '_' */ || c === 46 /* '.' */) {
-        // NAME 或 NUMBER: 回溯到非标识符字符
-        let k = j;
-        while (k >= 0) {
-          const ck = result.charCodeAt(k);
-          const isWord = (ck >= 48 && ck <= 57) || (ck >= 65 && ck <= 90) ||
-                         (ck >= 97 && ck <= 122) || ck === 95 || ck === 46;
-          if (!isWord) break;
-          k--;
-        }
-        atomStart = k + 1;
-        atom = result.substring(atomStart, j + 1);
-      } else {
-        continue;  // ! 之前不是原子 (运算符等), 跳过
       }
-      if (!atom) continue;
-      result = result.substring(0, atomStart) + 'factorial(' + atom + ')' + result.substring(i + 1);
+      if (idx < 0) break;  // 没有单 ! 了 (剩余 !! 留给 Python 端 _doublebang_to_doublefact)
+      // 向前回溯找原子起点 (跳过空白)
+      let j = idx - 1;
+      while (j >= 0 && (result.charCodeAt(j) === 32 || result.charCodeAt(j) === 9)) j--;
+      let atomStart = -1, atom = '';
+      if (j >= 0) {
+        const c = result.charCodeAt(j);
+        if (c === 41 /* ')' */) {
+          // 平衡括号: 找匹配的 (
+          let depth = 1;
+          let k = j - 1;
+          while (k >= 0 && depth > 0) {
+            const ck = result.charCodeAt(k);
+            if (ck === 41) depth++;
+            else if (ck === 40) depth--;
+            k--;
+          }
+          atomStart = k + 1;
+          atom = result.substring(atomStart, j + 1);
+        } else if ((c >= 48 && c <= 57) /* 0-9 */ ||
+                   (c >= 65 && c <= 90)  /* A-Z */ ||
+                   (c >= 97 && c <= 122) /* a-z */ ||
+                   c === 95 /* '_' */ || c === 46 /* '.' */) {
+          // NAME 或 NUMBER: 回溯到非标识符字符
+          let k = j;
+          while (k >= 0) {
+            const ck = result.charCodeAt(k);
+            const isWord = (ck >= 48 && ck <= 57) || (ck >= 65 && ck <= 90) ||
+                           (ck >= 97 && ck <= 122) || ck === 95 || ck === 46;
+            if (!isWord) break;
+            k--;
+          }
+          atomStart = k + 1;
+          atom = result.substring(atomStart, j + 1);
+        }
+      }
+      if (atomStart < 0 || !atom) {
+        // ! 之前不是原子 (运算符等, 如 !! 的尾部 !) -> 跳过此 !, 游标前进避免死循环
+        scanFrom = idx + 1;
+        continue;
+      }
+      result = result.substring(0, atomStart) + 'factorial(' + atom + ')' + result.substring(idx + 1);
+      scanFrom = 0;  // 替换后字符串变化, 从头重扫 (前面无单 !, 实际从 atomStart 之后即可, 0 安全)
     }
     return result;
   }
@@ -5449,7 +5543,7 @@
         callPython('/nsum', {
           expression: pyExpr,
           variable: varName,
-          start: Number(start) || 0,
+          start: _coerceNsumStart(start, 0),
           precision: options.precision || config.defaultPrecision,
           pythonUrl: options.pythonUrl,
           autoStartPython: !!(options.autoStartPython || config.pythonAutoStart),
@@ -5471,21 +5565,37 @@
   // r15: 数值无穷乘积 nprodAsync(变量, 下界, 表达式, options)
   //   product(n, 2, inf, body) -> nprodAsync('n', 2, 'body', {precision:50})
   //   走 Python mpmath.nprod
-  function nprodAsync(varName, start, expr, options) {
+  function nprodAsync(varName, start, expr, options, vars) {
     if (typeof varName !== 'string' || !varName) throw new TypeError('varName must be a non-empty string');
     if (typeof expr !== 'string') throw new TypeError('expr must be a string');
     options = options || {};
     const timeout = options.timeout || config.timeout;
     const usePython = !!(options.pythonUrl || config.pythonUrl || options.autoStartPython || config.pythonAutoStart);
 
+    // ★ Bug 54 修复: 接受第 5 个参数 vars, 把非常量变量代入 expr 后再发给 Python
+    //   例: nprodAsync('n', 1, '1-x^2/n^2', opts, {x:0.5}) -> body 变为 1-0.5^2/n^2
+    //   不替换 varName 本身 (乘积的 dummy 变量); vars 为空/省略时行为不变 (向后兼容)
+    let finalExpr = expr;
+    if (vars && typeof vars === 'object') {
+      try {
+        let ast = parse(expr);
+        for (const k in vars) {
+          if (Object.prototype.hasOwnProperty.call(vars, k) && k !== varName) {
+            ast = _substituteVar(ast, k, _newNum(vars[k]));
+          }
+        }
+        finalExpr = _astToString(ast);
+      } catch (_) { /* 解析失败, 用原 expr */ }
+    }
+
     if (usePython) {
       // ★ r15-amend3: n! 阶乘语法转 Python factorial(X)
-      const pyExpr = _toPythonBody(expr);
+      const pyExpr = _toPythonBody(finalExpr);
       return withTimeout(
         callPython('/nprod', {
           expression: pyExpr,
           variable: varName,
-          start: Number(start) || 1,
+          start: _coerceNsumStart(start, 1),
           precision: options.precision || config.defaultPrecision,
           pythonUrl: options.pythonUrl,
           autoStartPython: !!(options.autoStartPython || config.pythonAutoStart),
@@ -5511,6 +5621,22 @@
     if (x === Infinity || x === 'Infinity' || x === 'Inf' || x === 'INF') return 'inf';
     if (x === -Infinity || x === '-Infinity' || x === '-Inf' || x === '-INF') return '-inf';
     return String(x);
+  }
+
+  // ★ r15-amend9 Bug 5.1 + 4.1: nsum/nprod start 规整化
+  //   - Bug 5.1: start=0 不被 `Number(start) || default` 改为 default (Number(0)||1 === 1)
+  //   - Bug 4.1: fromRaw=±Infinity 路由到 marker 后, bot 把 'inf'/'-inf' 字符串传回 nsumAsync;
+  //     此处必须透传字符串给 Python, 不能 Number() (Number('inf')=NaN, JSON.stringify(Infinity)=null)
+  function _coerceNsumStart(start, defaultVal) {
+    if (start == null) return defaultVal;
+    if (start === Infinity) return 'inf';
+    if (start === -Infinity) return '-inf';
+    if (typeof start === 'string') {
+      const s = start.trim();
+      if (/^\+?inf$/i.test(s) || /^\+?infinity$/i.test(s)) return 'inf';
+      if (/^-inf$/i.test(s) || /^-infinity$/i.test(s)) return '-inf';
+    }
+    return Number(start);
   }
 
   // ★ r10: 数值无穷界定积分 integrateAsync(表达式, 变量, 下界, 上界, options)
@@ -5610,6 +5736,9 @@
       _simplifyAst: _simplifyAst,
       _astToString: _astToString,
       _dependsOn: _dependsOn,
+      _toPythonBody: _toPythonBody,
+      _coerceNsumStart: _coerceNsumStart,
+      _normalizeInfBound: _normalizeInfBound,
       config: config,
       FUNCTIONS: FUNCTIONS,
       CONSTANTS: CONSTANTS
