@@ -930,7 +930,7 @@ bot.on("message", async (msg) => {
 });
 
 // Python 高精度后端 URL (按你实际启动的端口/地址改)
-const PY_URL = null;          // ★ 让 autoStartPython 接管
+const PY_URL = process.env.PY_URL || null;  // ★ 让 autoStartPython 接管 (测试可设 PY_URL 环境变量)
 // 想全自动就改成:  null  +  { autoStartPython: true }
 // const PY_URL = null;
 
@@ -950,13 +950,81 @@ async function runCmd(rawLine) {
     }
   }
 
+  // ★ LaTeX 自动转换: 输入含 \ 时, 先 parseLatex 转一次
+  //   注意: 只对 expr 部分做转换, 不要碰 with 子句
+  //   特殊:  "for <func>'+(<var>)?"  求导请求, LaTeX 只应用于 for 左侧的 body,
+  //          避免 parseLatex 把 "for" 当 ident 触发了隐式乘 (*) 把 y'' 弄成 y**''
+  if (M.parseLatex && /\\/.test(expr)) {
+    try {
+      // 尝试匹配求导请求 (for 前面是 body, 后面是 func name + 一或多撇 + 可选 (var))
+      //   例子:  y=\sin(x^2) for y''       f(x)=x^3e^x for f'(x)
+      //          x^2  for g'(x)            x^2  for g''
+      const derivRe = /^(.+?)\s+for\s+([A-Za-z_]\w*)'{1,}\s*(?:\(\s*([A-Za-z_]\w*)\s*\))?\s*$/;
+      const dm = expr.match(derivRe);
+      if (dm) {
+        const lhs    = dm[1].trim();
+        const rhsRaw = expr.slice(lhs.length);  // 包括 ' for y'' / ' for f'(x)' 等
+        // 只对 lhs 做 LaTeX 转换, 保留 for 关键词及 rhs 原样
+        const lhsLatex = M.parseLatex(lhs);
+        expr = lhsLatex + rhsRaw;
+      } else {
+        expr = M.parseLatex(expr);
+      }
+    } catch (e) {
+      return 'LaTeX 解析失败: ' + e.message;
+    }
+  }
+
   // ★ 新增: limit(...) 语法 -> 走 Python 后端拿任意精度
-  //   匹配: limit(<expr>, <var>, <point>)   <point> 可以是 0/inf/1.5/pi 等
-  //   之前版本正则有 typo (\s*$ 写在 limit 后面, 永远匹配不到), 现已修正
-  const limitRe = /^\s*limit\s*\(\s*(.+?)\s*,\s*([A-Za-z_]\w*)\s*,\s*([^()]+?)\s*\)\s*$/i;
-  const limitMatch = expr.match(limitRe);
+  //   匹配: limit(<expr>, <var>, <point>[, <direction>])   <point> 可以是 0/inf/1.5/pi 等
+  //   direction ∈ {-1, 0, +1}  (r12: 支持单侧极限 + 显式双侧)
+  //   expr 内部可以含 sum(k,1,n,...) 等带逗号的函数调用, 用 balanced paren 找边界
+  //   之前版本正则在内部 sum 的逗号处截断, 现已改用 balance 解析
+  let limitMatch = null;
+  if (/^\s*limit\s*\(/i.test(expr)) {
+    // 找到 limit( 对应的 )
+    const lp = expr.indexOf('(');
+    let depth = 1, j = lp + 1;
+    while (j < expr.length && depth > 0) {
+      if (expr[j] === '(') depth++;
+      else if (expr[j] === ')') depth--;
+      if (depth === 0) break;
+      j++;
+    }
+    if (depth === 0) {
+      const inner = expr.slice(lp + 1, j);
+      // 在 inner 中找第一个外层 (depth=0) 的 ','
+      let d = 0, k = 0;
+      for (; k < inner.length; k++) {
+        if (inner[k] === '(') d++;
+        else if (inner[k] === ')') d--;
+        else if (inner[k] === ',' && d === 0) break;
+      }
+      if (k < inner.length) {
+        const limExpr = inner.slice(0, k);
+        const rest = inner.slice(k + 1);
+        // r12: 第 3 capture group 是可选 direction 数字字符串 (+1/-1/0)
+        const rm = rest.match(/^\s*([A-Za-z_]\w*)\s*,\s*([\s\S]+?)\s*(?:,\s*([+-]?\d+)\s*)?$/);
+        if (rm) {
+          // 解析 direction (可选).  rm[3] 可能 undefined (3-arg 形式)
+          let direction = null;
+          if (rm[3] != null) {
+            direction = parseInt(rm[3], 10);
+            if (direction !== -1 && direction !== 0 && direction !== 1) {
+              // 非法 direction: 走原 3-arg 路径, 不抛错 (兼容 r7 等历史, 不影响主流程)
+              direction = null;
+            }
+          }
+          limitMatch = { expr: limExpr, varName: rm[1], point: rm[2], direction };
+        }
+      }
+    }
+  }
   if (limitMatch) {
-    const [, limExprRaw, limVar, limPoint] = limitMatch;
+    const limExprRaw = limitMatch.expr;
+    const limVar     = limitMatch.varName;
+    const limPoint   = limitMatch.point;
+    const limDir     = limitMatch.direction;  // r12: 单/双侧, null = 3-arg 兼容
 
     // ★ 把 [数字][字母] 强制转成 [数字]*[字母], 避免 Python 后端 tokenize 隐式乘歧义
     //   "4x" -> "4*x", "2x" -> "2*x"
@@ -970,7 +1038,8 @@ async function runCmd(rawLine) {
         timeout: 15000
       };
       if (PY_URL) pyOpts.pythonUrl = PY_URL;
-      const r = await M.limitAsync(limExpr, limVar, limPoint.trim(), pyOpts);
+      // r12: 把 direction 透传给 limitAsync 第 5 参数 (null 时维持原 3-arg 行为)
+      const r = await M.limitAsync(limExpr, limVar, limPoint.trim(), pyOpts, limDir);
       return String(r);                          // 高精度字符串
     } catch (e) {
       // 后端挂了 -> 降级 JS 路径 (会有 1e-7 误差, 至少不报错)
@@ -997,14 +1066,205 @@ async function runCmd(rawLine) {
     }
   }
 
+  // 2.5) 解析 "for f'(x)" / "for f''" / "for f'''" 求导语法 (一阶/二阶/高阶)
+  //   例:  f(x)=x^3e^x for f'(x)         ->  diff(x^3e^x, x)  1 阶
+  //        f(x)=sin(x^2) for f''         ->  diff(diff(sin(x^2), x), x)  2 阶
+  //        f(x)=x^3      for f'''(x)     ->  3 阶
+  //        y=sin(x^2)    for y''         ->  y 形式 (function 名 = lhs 的 ident)
+  //        x^2           for g''(x)      ->  无函数定义, 直接对 x^2 求导
+  //   说明: 等号左边的 f(x)=... 是函数定义, 把右边 body 提出来求导;
+  //         如果不是函数定义, 就把整段表达式当作 body
+  const derivMatch = expr.match(/^(.+?)\s+for\s+([a-zA-Z_]\w*)('{1,})\s*(?:\(\s*([a-zA-Z_]\w*)\s*\))?\s*$/);
+  if (derivMatch) {
+    const lhs       = derivMatch[1].trim();
+    const _fnName   = derivMatch[2];   // 函数名 (f/y), 仅作标签, 不参与求导
+    const primes    = derivMatch[3];   // 一或多撇, 长度 = 阶数
+    const derivVar  = derivMatch[4] || 'x';  // 变量, 默认 x
+    const order     = primes.length;
+    // 提取函数体:  f(x) = body  /  y = body  /  无定义
+    const fnDefParen = lhs.match(/^[a-zA-Z_]\w*\s*\(\s*[a-zA-Z_]\w*\s*\)\s*=\s*([\s\S]+)$/);
+    const fnDefBare = lhs.match(/^[a-zA-Z_]\w*\s*=\s*([\s\S]+)$/);
+    let body;
+    if (fnDefParen) body = fnDefParen[1].trim();
+    else if (fnDefBare) body = fnDefBare[1].trim();
+    else body = lhs;
+    try {
+      // ★ 优先符号求导:  返回导函数表达式
+      //   - 若 vars 中给了 derivVar 的值, 代入求数值
+      //   - 否则直接返回符号表达式
+      //   - 符号不支持 (如 abs/!) 时 fallback 到数值求导
+      if (M.symbolicDiff) {
+        try {
+          // 高阶:  对 n 阶导数, 套 n 次 symbolicDiff
+          let cur = body;
+          for (let i = 0; i < order; i++) {
+            cur = M.symbolicDiff(cur, derivVar);
+          }
+          if (vars && Object.prototype.hasOwnProperty.call(vars, derivVar)) {
+            return formatNum(M.evaluate(cur, vars));
+          }
+          return cur;
+        } catch (e2) {
+          // 符号求导失败, 落到下面的数值求导
+        }
+      }
+      // 数值求导 fallback:  diff(diff(...diff(body, var), var), var)
+      let diffExpr = body;
+      for (let i = 0; i < order; i++) {
+        diffExpr = 'diff(' + diffExpr + ',' + derivVar + ')';
+      }
+      return formatNum(M.evaluate(diffExpr, vars));
+    } catch (e) {
+      return '求导失败: ' + e.message;
+    }
+  }
+
   // 3) 普通表达式 (能 evaluateAsync 就用, 拿到 Python 后端的精度)
   // ★ 提前拦截: sum/product/diff/integrate 走 JS 路径
   //   Python 后端 (mpmath) 没实现这 4 个高阶函数, 发过去会 HTTP 400
   //   limit 已经被前面的 limitRe 分支处理, 这里不重复
+  // ★ symbolicIntegrate 返回字符串 (反导函数表达式), 不要走 formatNum (避免变成 "NaN")
+  if (/^\s*symbolicIntegrate\s*\(/i.test(expr)) {
+    try {
+      const r = M.evaluate(expr, vars);
+      return (r === undefined || r === null) ? 'undefined' : String(r);
+    } catch (e) {
+      return '计算失败: ' + e.message;
+    }
+  }
+  // ★ r6: diff(f, x) 优先 symbolicDiff, 失败 fallback 数值 (避免直接走 Python 报 HTTP 400)
+  if (/^\s*diff\s*\(/i.test(expr)) {
+    try {
+      // 解析 diff(f, x) 取出 f 和 x (粗略, 但足够应付常见情况)
+      const m = expr.match(/^\s*diff\s*\(\s*(.+?)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*$/i);
+      if (m && M.symbolicDiff) {
+        const body = m[1];
+        const derivVar = m[2];
+        try {
+          const symRes = M.symbolicDiff(body, derivVar);
+          if (vars && Object.prototype.hasOwnProperty.call(vars, derivVar)) {
+            return formatNum(M.evaluate(symRes, vars));
+          }
+          return symRes;
+        } catch (e2) {
+          // 符号求导失败, 落到下面通用 sum/product/diff/integrate 数值路径
+        }
+      }
+    } catch (e) { /* parse 失败也 fallback */ }
+  }
   if (/^\s*(sum|product|diff|integrate)\s*\(/i.test(expr)) {
     try {
       return formatNum(M.evaluate(expr, vars));
     } catch (e) {
+      // ★ sum 上界是无穷 -> 抛 __NSUM_INF__:<var>:<from>:<encodedBody>
+      //   路由到 nsumAsync (Python mpmath.nsum)
+      if (e && e.message && e.message.indexOf('__NSUM_INF__:') === 0) {
+        const parts = e.message.split(':');
+        if (parts.length >= 4) {
+          const varName = parts[1];
+          const fromI   = parts[2];
+          const bodyStr = decodeURIComponent(parts.slice(3).join(':'));
+          try {
+            const pyOpts = {
+              precision: 50,
+              autoStartPython: (PY_URL == null),
+              timeout: 15000
+            };
+            if (PY_URL) pyOpts.pythonUrl = PY_URL;
+            // TODO: nsumAsync does not yet accept vars (mathEvaluator.js signature has no vars param)
+            const r = await M.nsumAsync(varName, fromI, bodyStr, pyOpts);
+            return String(r);
+          } catch (e2) {
+            return 'nsum 失败: ' + (e2.message || e2);
+          }
+        }
+      }
+      // ★ r15-amend2: product 上界为 inf -> 抛 __NPROD_INF__:<var>:<from>:<encodedBody>
+      //   路由到 nprodAsync (Python mpmath.nprod)
+      if (e && e.message && e.message.indexOf('__NPROD_INF__:') === 0) {
+        const parts = e.message.split(':');
+        if (parts.length >= 4) {
+          const varName = parts[1];
+          const fromI   = parts[2];
+          const bodyStr = decodeURIComponent(parts.slice(3).join(':'));
+          try {
+            const pyOpts = {
+              precision: 50,
+              autoStartPython: (PY_URL == null),
+              timeout: 15000
+            };
+            if (PY_URL) pyOpts.pythonUrl = PY_URL;
+            const r = await M.nprodAsync(varName, fromI, bodyStr, pyOpts, vars);
+            return String(r);
+          } catch (e2) {
+            return 'nprod 失败: ' + (e2.message || e2);
+          }
+        }
+      }
+      // ★ r10: integrate 上下界含无穷 -> 抛 __INTEGRATE_INF__:<var>:<aStr>:<bStr>:<encodedBody>
+      //   路由到 integrateAsync (Python mpmath.quad, 原生支持 inf/-inf)
+      if (e && e.message && e.message.indexOf('__INTEGRATE_INF__:') === 0) {
+        const parts = e.message.split(':');
+        if (parts.length >= 5) {
+          const varName = parts[1];
+          const aStr    = parts[2];
+          const bStr    = parts[3];
+          const bodyStr = decodeURIComponent(parts.slice(4).join(':'));
+          try {
+            const pyOpts = {
+              precision: 50,
+              autoStartPython: (PY_URL == null),
+              timeout: 15000
+            };
+            if (PY_URL) pyOpts.pythonUrl = PY_URL;
+            // TODO: integrateAsync does not yet accept vars (mathEvaluator.js signature has no vars param)
+            const r = await M.integrateAsync(bodyStr, varName, aStr, bStr, pyOpts);
+            return String(r);
+          } catch (e2) {
+            return 'integrate 失败: ' + (e2.message || e2);
+          }
+        }
+      }
+      // ★ product 自由变量上界 -> 抛 __PRODUCT_SYMBOUND__:<var>:<from>:<to>:<body>
+      //   路由到 symbolicProduct, 返回化简字符串
+      if (e && e.message && e.message.indexOf('__PRODUCT_SYMBOUND__:') === 0) {
+        const rest = e.message.substring('__PRODUCT_SYMBOUND__:'.length);
+        // rest = "varName:encodedFrom:encodedTo:encodedBody"
+        // 解码时只 decode URI, 不用 split, 因为 body 可能含 :
+        // 但 varName 不应含 :, 所以用 split 限定前 4 段
+        const parts = rest.split(':');
+        if (parts.length >= 4) {
+          const varName = parts[0];
+          const fromStr = decodeURIComponent(parts[1]);
+          const toStr   = decodeURIComponent(parts[2]);
+          const bodyStr = decodeURIComponent(parts.slice(3).join(':'));
+          try {
+            // 构造 product(变量, 下界, 上界, 表达式) 字符串
+            const callStr = 'product(' + varName + ',' + fromStr + ',' + toStr + ',' + bodyStr + ')';
+            return M.symbolicProduct(callStr);
+          } catch (e2) {
+            return 'symbolicProduct 失败: ' + (e2.message || e2);
+          }
+        }
+      }
+      // ★ sum 自由变量上界 -> 抛 __SUM_SYMBOUND__:<var>:<from>:<to>:<body>
+      //   路由到 symbolicSum, 返回化简字符串
+      if (e && e.message && e.message.indexOf('__SUM_SYMBOUND__:') === 0) {
+        const rest = e.message.substring('__SUM_SYMBOUND__:'.length);
+        const parts = rest.split(':');
+        if (parts.length >= 4) {
+          const varName = parts[0];
+          const fromStr = decodeURIComponent(parts[1]);
+          const toStr   = decodeURIComponent(parts[2]);
+          const bodyStr = decodeURIComponent(parts.slice(3).join(':'));
+          try {
+            const callStr = 'sum(' + varName + ',' + fromStr + ',' + toStr + ',' + bodyStr + ')';
+            return M.symbolicSum(callStr);
+          } catch (e2) {
+            return 'symbolicSum 失败: ' + (e2.message || e2);
+          }
+        }
+      }
       return '计算失败: ' + e.message;
     }
   }
@@ -1089,8 +1349,14 @@ function formatNum(v) {
 
     // 复数
     if (isComplex(v)) {
+        if (Math.abs(v.im) < 1e-10) return formatNum(v.re);
         if (v.im === 0) return formatNum(v.re);
-        if (v.re === 0) return formatNum(v.im) + 'i';
+        // ★ r15-amend2: 纯虚数时省略系数 1, 输出 "i" / "-i" 而不是 "1i" / "-1i"
+        if (v.re === 0) {
+            if (v.im === 1) return 'i';
+            if (v.im === -1) return '-i';
+            return formatNum(v.im) + 'i';
+        }
         return v.re + (v.im >= 0 ? '+' : '') + v.im + 'i';
     }
 
